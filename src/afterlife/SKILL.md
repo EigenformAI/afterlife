@@ -147,7 +147,7 @@ request outside them is refused with the reason.
 afterlife eval --run latest            # loss per trained memory and on held-out data, vs base and current adapter
 afterlife eval --run latest --probes   # side-by-side answers from base / current / updated
 afterlife activate --run <run-id>      # use it from the next session on
-afterlife rollback                     # back to the previous adapter (or --to base)
+afterlife rollback                     # undo the last switch; repeat to keep going back (or --to base)
 ```
 
 Each eval answers two kinds of prompt with each variant:
@@ -176,6 +176,7 @@ variant, so you can see whether the next you responds differently.
 - Your experiences, decisions and strategy changes are kept as plain JSONL in
   `.afterlife/`. You and your operator can read them back at any time.
 - `afterlife list` shows each experience's status: `eligible`, `nominated`,
-  `selected`, `trained`, `eval-only`, or a decision you made. Being selected doesn't
-  guarantee being trained. Duplicates, over-long records and the per-run budget
+  `selected`, `active` (trained into the adapter you're running now),
+  `trained` (in a finished run that isn't active), `eval-only`, or a
+  decision you made. Being selected doesn't guarantee being trained. Duplicates, over-long records and the per-run budget
   can still leave an experience out, and `preview` shows which ones and why.

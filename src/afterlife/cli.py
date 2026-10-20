@@ -103,21 +103,29 @@ def _brief(e: dict[str, Any]) -> str:
     return " ".join(first_user.split())[:70]
 
 
+def _train_ids(store: Store, run_id: str) -> set[str]:
+    return set(store.read_json(store.run_dir(run_id) / "selection.json", {}).get("train_ids", []))
+
+
 def _statuses(store: Store) -> dict[str, str]:
+    """active: in the adapter running now. trained: in a finished run that isn't active."""
     sel = select(store)
     latest = store.latest_decisions()
+    active_run = store.active().get("run_id")
+    in_active = _train_ids(store, active_run) if active_run else set()
     trained: set[str] = set()
     for run in store.runs():
         if run.get("status") == "ready":
-            s = store.read_json(store.run_dir(run["run_id"]) / "selection.json", {})
-            trained.update(s.get("train_ids", []))
+            trained |= _train_ids(store, run["run_id"])
     selected = {e["experience_id"] for e in sel["selected"]}
     out = {}
     for e in sel["eligible"]:
         eid = e["experience_id"]
         d = latest.get(eid, {}).get("decision")
-        if eid in trained:
-            out[eid] = "trained" if eid in selected else "trained-previously"
+        if eid in in_active:
+            out[eid] = "active"
+        elif eid in trained:
+            out[eid] = "trained"
         elif d and d != "nominate":
             out[eid] = d
         elif e.get("eval_only"):
@@ -326,10 +334,28 @@ def cmd_eval(args: argparse.Namespace) -> dict[str, Any]:
             "counts": manifest["selection"]["counts"], "eval": report}
 
 
-def _set_active(store: Store, run_id: str | None, actor: str, action: str) -> dict[str, Any]:
+def _activation_stack(history: list[dict[str, Any]]) -> list[str | None]:
+    """Replay activation history into a stack; its top is the current adapter (None = base).
+
+    activate and `rollback --to <run|base>` push; `rollback` (to previous) pops,
+    so repeated rollbacks keep walking back instead of bouncing between two runs.
+    """
+    stack: list[str | None] = [None]
+    for h in history:
+        if h["action"] == "rollback" and h.get("to", "previous") == "previous":
+            if len(stack) > 1:
+                stack.pop()
+        elif stack[-1] != h["run_id"]:
+            stack.append(h["run_id"])
+    return stack
+
+
+def _set_active(store: Store, run_id: str | None, actor: str, action: str, to: str | None = None) -> dict[str, Any]:
     active = store.active()
     adapter_path = str(store.run_dir(run_id) / "adapter") if run_id else None
     entry = {"run_id": run_id, "at": utc_now(), "by": actor, "action": action}
+    if to:
+        entry["to"] = to
     new = {"run_id": run_id, "adapter_path": adapter_path, "activated_at": entry["at"],
            "history": active.get("history", []) + [entry]}
     store.write_json(store.active_path, new)
@@ -368,9 +394,10 @@ def cmd_rollback(args: argparse.Namespace) -> dict[str, Any]:
     if args.to == "base":
         target = None
     elif args.to == "previous":
-        current = store.active().get("run_id")
-        earlier = [h["run_id"] for h in store.active().get("history", []) if h["run_id"] != current]
-        target = earlier[-1] if earlier else None
+        stack = _activation_stack(store.active().get("history", []))
+        if len(stack) < 2:
+            raise CliError("nothing earlier to roll back to", EXIT_INPUT)
+        target = stack[-2]
     else:
         try:
             manifest = store.resolve_run(args.to)
@@ -379,7 +406,7 @@ def cmd_rollback(args: argparse.Namespace) -> dict[str, Any]:
         if manifest["status"] != "ready":
             raise CliError(f"run {manifest['run_id']} is {manifest['status']}, not ready", EXIT_INPUT)
         target = manifest["run_id"]
-    result = _set_active(store, target, actor, "rollback")
+    result = _set_active(store, target, actor, "rollback", to=args.to if args.to in ("previous", "base") else "run")
     return {"active": result, "message": "takes effect in the next session"}
 
 
@@ -471,9 +498,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.set_defaults(decision=decision)
 
     sp = add("list", cmd_list, "list experiences and their status")
-    sp.add_argument("--status", choices=("eligible", "nominated", "selected", "trained",
-                                         "trained-previously", "eval-only", "reject", "defer",
-                                         "external-memory-only"))
+    sp.add_argument("--status", choices=("eligible", "nominated", "selected", "active", "trained",
+                                         "eval-only", "reject", "defer", "external-memory-only"))
     sp.add_argument("--tag")
     sp.add_argument("--limit", type=int, default=50)
 

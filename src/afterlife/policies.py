@@ -229,10 +229,15 @@ def order_experiences(
 
 
 def evaluate_policy(
-    policy: dict[str, Any], experiences: list[dict[str, Any]]
+    policy: dict[str, Any], experiences: list[dict[str, Any]], pool: list[dict[str, Any]] | None = None
 ) -> tuple[list[str], dict[str, str]]:
-    """Apply a validated policy. Returns (selected ids in order, {excluded id: reason})."""
-    ctx = _context(experiences)
+    """Apply a validated policy. Returns (selected ids in order, {excluded id: reason}).
+
+    ``pool`` is every stored experience: windows like recent_sessions count
+    sessions across all of it, even though only ``experiences`` (the ones the
+    agent hasn't decided about) are being selected from.
+    """
+    ctx = _context(pool if pool is not None else experiences)
     include = _compile(policy["include"], ctx)
     exclude = _compile(policy["exclude"], ctx)
     passed, excluded = [], {}

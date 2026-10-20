@@ -78,3 +78,10 @@ def test_contains_any_is_case_insensitive():
 def test_validation_errors(policy, message):
     with pytest.raises(PolicyError, match=message):
         validate_policy(policy)
+
+
+def test_recent_sessions_counts_sessions_the_agent_already_decided_on():
+    pool = _pool(("old", {"session": "s1"}), ("mid", {"session": "s2"}), ("new", {"session": "s3"}))
+    undecided = pool[:2]  # the agent has already nominated the newest session's experience
+    ids, _ = evaluate_policy(validate_policy({"include": [{"recent_sessions": 1}]}), undecided, pool)
+    assert ids == []  # s3 is the most recent session, not s2

@@ -196,6 +196,30 @@ def test_rollback_to_a_run_that_is_not_ready_is_refused(home, cli, write_json):
     assert Store(home).active().get("run_id") is None
 
 
+def test_repeated_rollback_walks_back_through_history(home, cli):
+    for i, run in enumerate(("run-a", "run-b", "run-c")):
+        _fake_ready_run(home, run, f"2026-01-0{i + 1}T00:00:00Z")
+        cli("activate", "--run", run)
+    assert [cli("rollback")[1]["active"]["run_id"] for _ in range(3)] == ["run-b", "run-a", None]
+    assert cli("rollback")[0] == 2  # nothing earlier than base
+
+    cli("activate", "--run", "run-c")
+    cli("rollback", "--to", "base")
+    assert cli("rollback")[1]["active"]["run_id"] == "run-c"  # undoes the jump to base
+
+
+def test_status_active_means_in_the_adapter_running_now(home, cli, write_json):
+    _, out = cli("nominate", "--file", write_json([experience("a"), experience("b", session="s2")]))
+    a, b = out["nominated"]
+    for run, ids in (("run-a", [a]), ("run-b", [b])):
+        _fake_ready_run(home, run, "2026-01-01T00:00:00Z")
+        Store(home).write_json(home / "runs" / run / "selection.json", {"train_ids": ids})
+    cli("activate", "--run", "run-a")
+    assert _ids(cli) == {a: "active", b: "trained"}
+    cli("rollback", "--to", "base")
+    assert _ids(cli) == {a: "trained", b: "trained"}
+
+
 def test_operator_can_forbid_agent_activation(home, cli):
     cfg = home / "config.toml"
     cfg.write_text(cfg.read_text().replace("agent_may_activate = true", "agent_may_activate = false"))

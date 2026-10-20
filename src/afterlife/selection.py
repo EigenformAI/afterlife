@@ -52,9 +52,9 @@ def select(store: Store, strategy: dict[str, Any] | None = None) -> dict[str, An
             excluded[e["experience_id"]] = "manual mode: not nominated"
         auto = []
     elif mode == "all":
-        auto = undecided
+        auto = order_experiences(undecided, "priority")
     else:
-        ids, policy_excluded = evaluate_policy(strategy["policy"], undecided)
+        ids, policy_excluded = evaluate_policy(strategy["policy"], undecided, experiences)
         excluded.update(policy_excluded)
         by_id = {e["experience_id"]: e for e in undecided}
         auto = [by_id[i] for i in ids]
@@ -63,7 +63,7 @@ def select(store: Store, strategy: dict[str, Any] | None = None) -> dict[str, An
         "mode": mode,
         "policy_hash": strategy.get("policy_hash"),
         "eligible": experiences,
-        "selected": explicit_in + auto,
+        "selected": explicit_in + auto,  # auto in the mode's / policy's order
         "explicit_ids": [e["experience_id"] for e in explicit_in],
         "eval_only": eval_only,
         "excluded": excluded,
@@ -122,9 +122,10 @@ def build_training_set(store: Store, config: Config, split_seed: str = "") -> di
         else:
             train.append(e)
 
-    # Budget: explicit nominations first, then by priority / recency.
-    ordered = order_experiences(train, "priority")
-    ordered.sort(key=lambda e: e["experience_id"] not in explicit)
+    # Budget: explicit nominations first (by priority), then the mode's or
+    # policy's own order, so a policy's order_by decides what a cap cuts.
+    ordered = order_experiences([e for e in train if e["experience_id"] in explicit], "priority")
+    ordered += [e for e in train if e["experience_id"] not in explicit]
     for e in ordered[op.max_examples_per_run :]:
         excluded[e["experience_id"]] = f"over budget ({op.max_examples_per_run} per run)"
     train = ordered[: op.max_examples_per_run]

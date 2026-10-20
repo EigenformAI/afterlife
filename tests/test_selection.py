@@ -170,3 +170,25 @@ def test_nested_brief_format_is_accepted():
     })
     assert exp["tags"] == ["debugging"] and exp["priority"] == 0.85
     assert exp["source"]["session_id"] == "session-17"
+
+
+def _set_created(home, stamps):
+    path = home / "experiences.jsonl"
+    rows = [json.loads(l) for l in path.read_text().splitlines()]
+    for row, ts in zip(rows, stamps):
+        row["created_at"] = ts
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
+def test_budget_follows_the_policy_order(home, cli, write_json):
+    cfg = home / "config.toml"
+    cfg.write_text(cfg.read_text().replace("max_examples_per_run = 500", "max_examples_per_run = 2")
+                   .replace("eval_fraction = 0.15", "eval_fraction = 0.0"))
+    _, out = cli("add", "--file", write_json([
+        experience("old", priority=0.9), experience("mid", priority=0.1), experience("new", priority=0.5),
+    ]))
+    old, mid, new = out["added"]
+    _set_created(home, ["2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z"])
+    cli("policy", "set", "--file", write_json({"order_by": "recent"}))
+    train, _ = _split(home)
+    assert train == {new, mid}  # not the highest-priority ones

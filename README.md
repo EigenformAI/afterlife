@@ -77,7 +77,8 @@ afterlife serve-cmd                         # prints the vLLM command for base +
 ```
 
 Point your agent at model name `afterlife` on that server. `afterlife rollback`
-goes back to the previous adapter, and `rollback --to base` turns adapters off.
+undoes the last switch (repeat it to keep going back), and `rollback --to base`
+turns adapters off.
 Restart or reload the server after either one.
 
 ## Supported stack (v0.1)

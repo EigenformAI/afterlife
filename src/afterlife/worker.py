@@ -61,10 +61,35 @@ def _set_request(store: Store, request: dict[str, Any], status: str, **extra: An
     store.save_request(request)
 
 
+def _frozen_training_set(store: Store, config: Config, request: dict[str, Any]) -> dict[str, Any] | None:
+    """Rebuild the training set the agent saw at request time, under current caps."""
+    frozen = request.get("frozen_selection")
+    if not frozen:
+        return None
+    by_id = {e["experience_id"]: e for e in store.experiences()}
+    cap = config.operator.max_examples_per_run
+    excluded = dict(frozen["excluded"])
+    train = [by_id[i] for i in frozen["train_ids"] if i in by_id]
+    for e in train[cap:]:
+        excluded[e["experience_id"]] = f"over budget ({cap} per run)"
+    train = train[:cap]
+    heldout = [by_id[i] for i in frozen["heldout_ids"] if i in by_id]
+    strategy = request.get("strategy_at_request", {})
+    return {
+        "mode": strategy.get("mode"),
+        "policy_hash": strategy.get("policy_hash"),
+        "train": train,
+        "heldout": heldout,
+        "excluded": excluded,
+        "counts": {**request.get("counts_at_request", {}), "train": len(train), "heldout": len(heldout),
+                   "train_chars": sum(e["chars"] for e in train)},
+    }
+
+
 def prepare_run(store: Store, config: Config, request: dict[str, Any]) -> Path:
     """Freeze the selection for a request into runs/<run-id>/. Returns the run dir."""
     recipe = resolve_recipe(config, request["method"], request.get("params", {}))
-    ts = build_training_set(store, config)
+    ts = _frozen_training_set(store, config, request) or build_training_set(store, config)
     if not ts["train"]:
         raise WorkerError("nothing to train on: the current selection is empty after validation")
 
@@ -153,9 +178,15 @@ def process_request(store: Store, request: dict[str, Any], *, dry_run: bool = Fa
             store, run_dir, status="evaluating", adapter_path=str(run_dir / "adapter"),
             train_seconds=round(time.time() - started, 1),
         )
+        started = time.time()
         _child("eval", run_dir)
         eval_report = store.read_json(run_dir / "eval.json")
-        manifest = _update_manifest(store, run_dir, status="ready", eval=eval_report.get("summary"))
+        manifest = _update_manifest(
+            store, run_dir, status="ready", eval=eval_report.get("summary"),
+            eval_seconds=round(time.time() - started, 1),
+            peak_gpu_gb={step: (store.read_json(run_dir / f"{step}_stats.json") or {}).get("peak_gpu_gb")
+                         for step in ("train", "eval")},
+        )
     except Exception as exc:
         _update_manifest(store, run_dir, status="failed", error=str(exc))
         _set_request(store, request, "failed", error=str(exc))
@@ -205,7 +236,16 @@ def _eval_child(run_dir: Path) -> None:
     evaluate_run(run_dir)
 
 
+def _record_peak_memory(run_dir: Path, step: str) -> None:
+    import torch
+
+    if torch.cuda.is_available():
+        peak = max(torch.cuda.max_memory_reserved(i) for i in range(torch.cuda.device_count()))
+        Store.write_json(run_dir / f"{step}_stats.json", {"peak_gpu_gb": round(peak / 2**30, 2)})
+
+
 if __name__ == "__main__":
     step, target = sys.argv[1], Path(sys.argv[2])
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     {"train": _train_child, "eval": _eval_child}[step](target)
+    _record_peak_memory(target, step)

@@ -243,6 +243,8 @@ class TestLoadSftDataset(unittest.TestCase):
         self.assertEqual(dataset[0]["length"], len(dataset[0]["input_ids"]))
 
     def test_build_query_response_sft_row_rejects_non_prefix_template(self):
+        # Fallback path (response text not found in the rendering): the NSL2
+        # boundary check still rejects templates whose prompt is not a prefix.
         from afterlife.trainer.qlora import _build_query_response_sft_row
 
         tokenizer = self._make_tokenizer()
@@ -251,7 +253,7 @@ class TestLoadSftDataset(unittest.TestCase):
         def bad_template(messages, tokenize, add_generation_prompt):
             if len(messages) == 1:
                 return "<other-prefix>"
-            return original(messages, tokenize, add_generation_prompt)
+            return original(messages, tokenize, add_generation_prompt).replace("Answer", "ANSWER")
 
         tokenizer.apply_chat_template = bad_template
 
@@ -261,6 +263,31 @@ class TestLoadSftDataset(unittest.TestCase):
                 prompt="Question",
                 raw_response="Answer",
             )
+
+    def test_build_query_response_sft_row_masks_template_scaffold(self):
+        # Afterlife: only response content + end-of-turn marker carry loss; the
+        # assistant marker, an empty think block, and trailing whitespace do not.
+        from afterlife.trainer.qlora import _build_query_response_sft_row
+
+        class QwenLikeTokenizer:
+            pad_token_id = 0
+            eos_token_id = 2
+
+            def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+                text = f"<im_start>user\n{messages[0]['content']}<im_end>\n"
+                if len(messages) > 1:
+                    text += f"<im_start>assistant\n<think>\n\n</think>\n\n{messages[1]['content']}<im_end>\n"
+                return text
+
+            def __call__(self, text=None, **_kwargs):
+                return {"input_ids": [ord(c) for c in text], "attention_mask": [1] * len(text)}
+
+            def decode(self, ids):
+                return "".join(chr(i) for i in ids)
+
+        row = _build_query_response_sft_row(QwenLikeTokenizer(), prompt="Q", raw_response="Answer")
+        trained = "".join(chr(i) for i, m in zip(row["input_ids"], row["completion_mask"]) if m)
+        self.assertEqual(trained, "Answer<im_end>")
 
     def test_build_query_response_sft_row_handles_thinking_channel_scaffold(self):
         # Regression: Gemma 4's chat template appends a thought-channel scaffold when

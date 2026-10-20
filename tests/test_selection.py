@@ -2,13 +2,25 @@ import pytest
 from conftest import experience
 
 from afterlife.schemas import ValidationError, build_experience, dedup_key
-from afterlife.selection import _is_heldout, build_training_set, to_trainer_row
+from afterlife.selection import _heldout_sessions, build_training_set, to_trainer_row
 from afterlife.store import Store
 
 
-def test_heldout_split_keeps_sessions_together():
-    for session in ("s1", "s2", "s3", "alpha", "beta"):
-        assert len({_is_heldout(session, f"exp-{i}", 0.5) for i in range(20)}) == 1
+def _exps(sessions):
+    return [build_experience(experience(f"e{i}", session=s)) for i, s in enumerate(sessions)]
+
+
+def test_heldout_holds_out_whole_sessions():
+    held = _heldout_sessions(_exps(["s1", "s1", "s2", "s2", "s3"]), 0.3)
+    assert len(held) == 1 and held <= {"s1", "s2", "s3"}
+
+
+def test_heldout_always_holds_out_something_and_never_everything():
+    sessions = [f"s{i:02d}" for i in range(12)]
+    assert len(_heldout_sessions(_exps(sessions), 0.15)) == 2  # ceil(0.15 * 12)
+    assert len(_heldout_sessions(_exps(["a", "b"]), 0.9)) == 1
+    assert _heldout_sessions(_exps(["only"] * 5), 0.5) == set()
+    assert _heldout_sessions(_exps(sessions), 0.0) == set()
 
 
 def test_budget_prefers_explicit_nominations(home, cli, write_json):

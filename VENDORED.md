@@ -15,6 +15,15 @@ Local changes are limited to:
 
 - `src.train.*` imports → `afterlife.trainer.*` (code and test patch targets)
 - argparse description string in `qlora.py`
+- `_build_query_response_sft_row` (`qlora.py`): the loss now covers only the
+  response content plus the end-of-turn token. NSL2's version also trained on
+  the assistant turn marker, any template scaffold before the response (e.g.
+  Qwen3's empty `<think></think>`), and the newline after `<|im_end|>`. On
+  Qwen3-8B those cost ~25, ~21 and ~23 nats per row under the base model, and
+  training on the empty think block taught adapters to stop thinking. The NSL2
+  behaviour is kept as `_build_query_response_sft_row_nsl` and used as the
+  fallback when the response text can't be found on a token boundary. NSL2 is
+  probably affected too (at least the turn marker and trailing newline).
 
 Keep the diff against NSL2 that small: Afterlife calls `train_sft()` from
 `afterlife/worker.py`, so fixes can be ported in either direction by copying

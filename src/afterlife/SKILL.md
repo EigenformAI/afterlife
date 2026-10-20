@@ -41,6 +41,8 @@ respond to.
 
 `tags`, `kind`, `priority`, `session_id` and `url` are optional. Write the
 final turn as the behaviour you want, not as a raw dump of what happened.
+If your model thinks before answering, put only the answer in the final turn.
+Reasoning isn't trained on, and your thinking is left as it is.
 Don't include secrets, credentials or other people's personal details. Don't
 paste long copyrighted text either: the adapter may learn to reproduce it.
 Records that look like they contain credentials are refused.

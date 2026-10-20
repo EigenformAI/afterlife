@@ -177,7 +177,7 @@ class Store:
 
     def requests(self) -> list[dict[str, Any]]:
         out = [self.read_json(p) for p in sorted(self.requests_dir.glob("*.json"))]
-        return sorted(out, key=lambda r: r["created_at"])
+        return sorted(out, key=lambda r: (r["created_at"], r.get("created_ns", 0)))
 
     def save_request(self, request: dict[str, Any]) -> None:
         self.write_json(self.requests_dir / f"{request['request_id']}.json", request)

@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from importlib import resources
 from pathlib import Path
 from typing import Any, Callable
@@ -129,8 +130,10 @@ def cmd_init(args: argparse.Namespace) -> dict[str, Any]:
     if store.exists() and not args.force:
         return {"root": str(store.root), "created": False, "message": "already initialised"}
     store.init_layout()
-    store.config_path.write_text(render_default_config(args.model), encoding="utf-8")
-    return {"root": str(store.root), "created": True, "base_model": args.model}
+    store.config_path.write_text(render_default_config(args.model, args.serve_model), encoding="utf-8")
+    config = store.config()
+    return {"root": str(store.root), "created": True, "base_model": config.base_model,
+            "serve_model": config.serve_model}
 
 
 def cmd_skill(args: argparse.Namespace) -> dict[str, Any]:
@@ -262,6 +265,13 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
         "status": "pending", "method": args.method, "params": overrides, "note": args.note,
         "strategy_at_request": {"mode": ts["mode"], "policy_hash": ts["policy_hash"]},
         "counts_at_request": ts["counts"],
+        # What gets trained is fixed now, not when the worker gets round to it.
+        "frozen_selection": {
+            "train_ids": [e["experience_id"] for e in ts["train"]],
+            "heldout_ids": [e["experience_id"] for e in ts["heldout"]],
+            "excluded": ts["excluded"],
+        },
+        "created_ns": time.time_ns(),
     }
     store.save_request(request)
     return {"request": request, "recipe": recipe,
@@ -362,13 +372,11 @@ def cmd_serve_cmd(args: argparse.Namespace) -> dict[str, Any]:
     store = _store(args)
     config = store.config()
     active = store.active()
-    cmd = ["vllm", "serve", config.base_model, "--max-model-len", str(config.max_seq_length)]
-    if "bnb" in config.base_model.lower():
-        cmd += ["--quantization", "bitsandbytes", "--load-format", "bitsandbytes"]
+    cmd = ["vllm", "serve", config.serve_model, "--max-model-len", str(config.max_seq_length)]
     if active.get("run_id"):
         cmd += ["--enable-lora", "--max-lora-rank", "64",
                 "--lora-modules", f"afterlife={store.root / 'active-adapter'}"]
-    return {"command": cmd, "model_name": "afterlife" if active.get("run_id") else config.base_model,
+    return {"command": cmd, "model_name": "afterlife" if active.get("run_id") else config.serve_model,
             "shell": " ".join(cmd)}
 
 
@@ -423,7 +431,8 @@ def build_parser() -> argparse.ArgumentParser:
         return sp
 
     sp = add("init", cmd_init, "create a store with a default operator config")
-    sp.add_argument("--model", default=DEFAULT_BASE_MODEL)
+    sp.add_argument("--model", default=DEFAULT_BASE_MODEL, help="training checkpoint")
+    sp.add_argument("--serve-model", help="model vLLM serves the adapter on (default: known full-precision original)")
     sp.add_argument("--force", action="store_true", help="overwrite an existing config")
 
     add("skill", cmd_skill, "print the agent-facing SKILL.md")

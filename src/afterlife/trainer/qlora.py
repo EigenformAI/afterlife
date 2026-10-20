@@ -528,6 +528,51 @@ def _build_query_response_sft_row(
     prompt: str,
     raw_response: str,
 ) -> dict[str, Any]:
+    # Afterlife: put the loss on the response content and the end-of-turn marker
+    # only. Everything the template renders before the response (the assistant
+    # turn marker, an empty Qwen3 <think></think> block, Gemma's model-turn
+    # scaffold) is treated as prompt, and whitespace after the end-of-turn token
+    # is dropped: the model never generates either at inference. This keeps
+    # thinking models from learning "skip thinking" from answer-only examples.
+    # Falls back to the NSL2 boundary below when the response text cannot be
+    # located on a token boundary in the rendered conversation.
+    full_text = tokenizer.apply_chat_template(
+        [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": raw_response},
+        ],
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+    start = full_text.rfind(raw_response) if raw_response else -1
+    if start > 0:
+        prefix_ids = _tokenize_text(tokenizer, full_text[:start])
+        row = _encode_text(tokenizer, full_text)
+        input_ids = row["input_ids"]
+        if 0 < len(prefix_ids) < len(input_ids) and input_ids[: len(prefix_ids)] == prefix_ids:
+            end = len(input_ids)
+            decode = getattr(getattr(tokenizer, "tokenizer", tokenizer), "decode", None)
+            if decode is not None:
+                while end > len(prefix_ids) + 1 and not decode(input_ids[end - 1 : end]).strip():
+                    end -= 1
+            row["completion_mask"] = (
+                [0] * len(prefix_ids)
+                + [1] * (end - len(prefix_ids))
+                + [0] * (len(input_ids) - end)
+            )
+            row["length"] = len(input_ids)
+            return row
+    return _build_query_response_sft_row_nsl(
+        tokenizer, prompt=prompt, raw_response=raw_response
+    )
+
+
+def _build_query_response_sft_row_nsl(
+    tokenizer: Any,
+    *,
+    prompt: str,
+    raw_response: str,
+) -> dict[str, Any]:
     # Render the masked-prompt boundary WITHOUT the generation prompt. Gemma 4's
     # chat template, with add_generation_prompt=True, appends a "thinking channel"
     # scaffold ("<start_of_turn>model\n<|channel>thought\n<channel|>") that the

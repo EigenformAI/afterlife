@@ -82,11 +82,23 @@ Restart or reload the server after either one.
 
 | | |
 |---|---|
-| Base model | `unsloth/Qwen3-8B-unsloth-bnb-4bit` (set in `config.toml`; other Unsloth/Transformers checkpoints may work) |
+| Training checkpoint | `unsloth/Qwen3-8B-unsloth-bnb-4bit` by default (`[model].base_model`); thinking and non-thinking chat models both work |
+| Serving model | `Qwen/Qwen3-8B` (`[model].serve_model`): the full-precision original, with the adapter applied by vLLM |
 | Training | Unsloth + TRL + PEFT LoRA, from NSL2's trainer (see [VENDORED.md](VENDORED.md)) |
 | Methods | `sft`, `dft`, `asft`. The agent picks one per request. |
-| Inference | vLLM with `--enable-lora`, serving the same bnb-4bit checkpoint |
-| Target hardware | one 24 GB NVIDIA GPU (not yet verified end-to-end; see below) |
+| Inference | vLLM (tested 0.32) with `--enable-lora`; needs `ninja` on `PATH` for its JIT kernels |
+| Hardware | tested on one 48 GB A6000; see each run's `peak_gpu_gb` in its manifest |
+
+Current vLLM can't load bitsandbytes checkpoints, which is why training and
+serving use different copies of the same model. `afterlife init --model X`
+fills in `serve_model` for known checkpoints; otherwise set it yourself.
+
+**Thinking models:** only the final answer carries loss. The template's
+scaffold before it (an empty `<think></think>` for Qwen3) is treated as
+prompt, so adapters don't learn to skip thinking. Probe answers in `eval`
+are stored with `thinking` and `answer` separated. Raise
+`[eval].probe_max_new_tokens` if `probes_unfinished` shows answers being cut
+off mid-thought.
 
 GGUF, Ollama and llama.cpp can't load a PEFT adapter directly. The trainer can
 export GGUF or merged weights, but v0.1 doesn't wire that path up.
@@ -153,9 +165,12 @@ out.
 
 ## Limitations
 
-- Not yet run end-to-end on GPU from this repo. The trainer is NSL2's tested
-  code path, but the evaluator and the vLLM serving notes are new.
+- Only smoke-tested on GPU: one 28-example synthetic set, 40 steps per method.
 - Each run starts from the base model; adapters don't stack.
+- The selection is frozen when the agent makes the request; later changes
+  don't affect a queued run.
+- Experiences carry the answer only. A thinking model's reasoning isn't
+  trained on.
 - Multi-turn experiences are flattened into one prompt plus the final reply.
   The loss covers only the final reply.
 - Duplicate detection is exact after normalising case and whitespace.

@@ -11,6 +11,7 @@ Every excluded experience gets a reason, so `selected != trained` is visible.
 from __future__ import annotations
 
 import hashlib
+import math
 from typing import Any
 
 from afterlife.config import Config
@@ -60,10 +61,18 @@ def select(store: Store, strategy: dict[str, Any] | None = None) -> dict[str, An
     }
 
 
-def _is_heldout(session_id: str | None, experience_id: str, fraction: float) -> bool:
-    key = session_id or experience_id
-    bucket = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
-    return bucket < fraction
+def _heldout_sessions(experiences: list[dict[str, Any]], fraction: float) -> set[str]:
+    """Pick ceil(fraction * n) sessions by hash; at least one when there are >= 2.
+
+    Splitting by session keeps paraphrases of one episode on the same side.
+    Experiences without a session_id count as their own session.
+    """
+    keys = sorted({e["source"].get("session_id") or e["experience_id"] for e in experiences})
+    if fraction <= 0 or len(keys) < 2:
+        return set()
+    n = min(len(keys) - 1, max(1, math.ceil(fraction * len(keys))))
+    ranked = sorted(keys, key=lambda k: hashlib.sha256(k.encode()).hexdigest())
+    return set(ranked[:n])
 
 
 def build_training_set(store: Store, config: Config) -> dict[str, Any]:
@@ -90,15 +99,11 @@ def build_training_set(store: Store, config: Config) -> dict[str, Any]:
             seen[e["dedup_key"]] = eid
             valid.append(e)
 
+    held = _heldout_sessions(valid, op.eval_fraction)
     train, heldout = [], []
     for e in valid:
-        if _is_heldout(e["source"].get("session_id"), e["experience_id"], op.eval_fraction):
-            heldout.append(e)
-        else:
-            train.append(e)
-    # Never hold out everything: tiny pools would otherwise train on nothing.
-    if not train and heldout:
-        train, heldout = heldout, []
+        key = e["source"].get("session_id") or e["experience_id"]
+        (heldout if key in held else train).append(e)
 
     # Budget: explicit nominations first, then by priority / recency.
     explicit = set(sel["explicit_ids"])

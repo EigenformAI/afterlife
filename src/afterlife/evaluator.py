@@ -20,8 +20,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
-MAX_LOSS_ROWS = 200
-PROBE_MAX_NEW_TOKENS = 256
+PROBE_BATCH_SIZE = 8
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -37,13 +36,15 @@ def load_probes(store_root: Path) -> list[dict[str, Any]]:
     return [p for p in probes if isinstance(p.get("prompt"), str)]
 
 
-def _mean_completion_nll(model: Any, tokenizer: Any, rows: list[dict[str, Any]], max_seq_length: int) -> float | None:
+def _mean_completion_nll(
+    model: Any, tokenizer: Any, rows: list[dict[str, Any]], max_seq_length: int, max_rows: int
+) -> float | None:
     import torch
 
     from afterlife.trainer.qlora import _build_completion_only_labels, _build_query_response_sft_row
 
     total, count = 0.0, 0
-    for row in rows[:MAX_LOSS_ROWS]:
+    for row in rows[:max_rows]:
         enc = _build_query_response_sft_row(tokenizer, prompt=row["prompt"], raw_response=row["raw_response"])
         ids = enc["input_ids"][:max_seq_length]
         labels = _build_completion_only_labels(input_ids=ids, completion_mask=enc["completion_mask"][:max_seq_length])
@@ -58,17 +59,45 @@ def _mean_completion_nll(model: Any, tokenizer: Any, rows: list[dict[str, Any]],
     return total / count if count else None
 
 
-def _generate(model: Any, tokenizer: Any, prompt: str) -> str:
+def split_thinking(text: str) -> dict[str, str | None]:
+    """Separate a thinking model's reasoning from its answer.
+
+    Returns thinking=None for non-thinking output. An unfinished think block
+    (budget ran out) yields answer="" so that case is visible, not hidden.
+    """
+    if "</think>" in text:
+        thinking, answer = text.split("</think>", 1)
+        return {"thinking": thinking.replace("<think>", "").strip(), "answer": answer.strip()}
+    if text.lstrip().startswith("<think>"):
+        return {"thinking": text.replace("<think>", "").strip(), "answer": ""}
+    return {"thinking": None, "answer": text.strip()}
+
+
+def _generate(model: Any, tokenizer: Any, prompts: list[str], max_new_tokens: int) -> list[str]:
     import torch
 
-    text = tokenizer.apply_chat_template(
-        [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True
-    )
     text_tok = getattr(tokenizer, "tokenizer", tokenizer)
-    inputs = text_tok(text, return_tensors="pt").to(next(model.parameters()).device)
-    with torch.no_grad():
-        out = model.generate(**inputs, max_new_tokens=PROBE_MAX_NEW_TOKENS, do_sample=False)
-    return text_tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+    text_tok.padding_side = "left"
+    if text_tok.pad_token_id is None:
+        text_tok.pad_token = text_tok.eos_token
+    device = next(model.parameters()).device
+    outputs: list[str] = []
+    for i in range(0, len(prompts), PROBE_BATCH_SIZE):
+        batch = [
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True
+            )
+            for p in prompts[i : i + PROBE_BATCH_SIZE]
+        ]
+        inputs = text_tok(batch, return_tensors="pt", padding=True, add_special_tokens=False).to(device)
+        with torch.no_grad():
+            out = model.generate(
+                **inputs, max_new_tokens=max_new_tokens, do_sample=False,
+                pad_token_id=text_tok.pad_token_id,
+            )
+        width = inputs["input_ids"].shape[1]
+        outputs += [text_tok.decode(row[width:], skip_special_tokens=True) for row in out]
+    return outputs
 
 
 def evaluate_run(run_dir: Path) -> dict[str, Any]:
@@ -77,9 +106,11 @@ def evaluate_run(run_dir: Path) -> dict[str, Any]:
     from peft import PeftModel
     from unsloth import FastLanguageModel
 
+    from afterlife.config import load_config
     from afterlife.trainer.qlora import _load_base_model
 
     store_root = run_dir.parent.parent
+    eval_cfg = load_config(store_root / "config.toml").eval
     manifest = json.loads((run_dir / "manifest.json").read_text())
     max_seq = manifest["train_sft_kwargs"]["max_seq_length"]
 
@@ -107,15 +138,17 @@ def evaluate_run(run_dir: Path) -> dict[str, Any]:
     probes = load_probes(store_root)
 
     losses: dict[str, dict[str, float | None]] = {}
-    answers: dict[str, dict[str, str]] = {p.get("id", str(i)): {} for i, p in enumerate(probes)}
+    answers: dict[str, dict[str, Any]] = {p.get("id", str(i)): {} for i, p in enumerate(probes)}
+    n_loss = eval_cfg.max_loss_rows
     for name in variants:
         with use(name):
             losses[name] = {
-                "heldout": _mean_completion_nll(model, tokenizer, heldout_rows, max_seq),
-                "train": _mean_completion_nll(model, tokenizer, train_rows, max_seq),
+                "heldout": _mean_completion_nll(model, tokenizer, heldout_rows, max_seq, n_loss),
+                "train": _mean_completion_nll(model, tokenizer, train_rows, max_seq, n_loss),
             }
-            for i, p in enumerate(probes):
-                answers[p.get("id", str(i))][name] = _generate(model, tokenizer, p["prompt"])
+            texts = _generate(model, tokenizer, [p["prompt"] for p in probes], eval_cfg.probe_max_new_tokens)
+            for i, (p, text) in enumerate(zip(probes, texts)):
+                answers[p.get("id", str(i))][name] = split_thinking(text)
 
     for split in losses.values():
         for k, v in split.items():
@@ -133,6 +166,11 @@ def evaluate_run(run_dir: Path) -> dict[str, Any]:
         "train_loss_change_vs_base": delta("train", "base"),
         "heldout_rows": len(heldout_rows),
         "probes": len(probes),
+        "probes_unfinished": {
+            name: sum(1 for a in answers.values() if a.get(name, {}).get("answer") == "")
+            for name in variants
+        },
+        "probe_max_new_tokens": eval_cfg.probe_max_new_tokens,
         "note": "Negative loss change = updated adapter predicts those memories better. "
         "Read the probe answers before activating; loss does not show regressions on its own.",
     }

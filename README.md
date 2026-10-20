@@ -204,8 +204,9 @@ out.
   don't affect a queued run.
 - Experiences carry the answer only. A thinking model's reasoning isn't
   trained on.
-- Multi-turn experiences are flattened into one prompt plus the final reply.
-  The loss covers only the final reply.
+- Multi-turn experiences are flattened into a plain-text prompt for each target
+  turn (the final assistant turn, or each turn marked `"train": true`). The
+  loss covers only the target turn.
 - Duplicate detection is exact after normalising case and whitespace.
   Near-duplicates get through.
 - No promise that a selected memory improves anything. Check `eval` first.

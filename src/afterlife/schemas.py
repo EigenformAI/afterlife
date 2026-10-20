@@ -60,13 +60,30 @@ def check_messages(messages: Any) -> list[str]:
             problems.append(f"messages[{i}].role must be one of {sorted(ROLES)}")
         if not isinstance(m.get("content"), str):
             problems.append(f"messages[{i}].content must be a string")
+        if "train" in m and not isinstance(m["train"], bool):
+            problems.append(f"messages[{i}].train must be true or false")
+        elif m.get("train") and m.get("role") != "assistant":
+            problems.append(f"messages[{i}]: only assistant turns can be marked train")
     if problems:
         return problems
-    if messages[-1]["role"] != "assistant" or not messages[-1]["content"].strip():
-        problems.append("last message must be a non-empty assistant turn (that is what gets learned)")
-    if not any(m["role"] == "user" for m in messages[:-1]):
-        problems.append("need at least one user turn before the final assistant turn")
+    for i in target_turns(messages):
+        if not messages[i]["content"].strip():
+            problems.append(f"messages[{i}] is a training target but empty")
+        if not any(m["role"] == "user" for m in messages[:i]):
+            problems.append(f"messages[{i}] is a training target with no user turn before it")
+    if not any(m.get("train") for m in messages) and messages[-1]["role"] != "assistant":
+        problems.append(
+            "last message must be an assistant turn, or mark the assistant turns to learn with \"train\": true"
+        )
     return problems
+
+
+def target_turns(messages: list[dict[str, Any]]) -> list[int]:
+    """Indices of the assistant turns to learn: those marked train=true, else the last turn."""
+    marked = [i for i, m in enumerate(messages) if m.get("train") is True]
+    if marked:
+        return marked
+    return [len(messages) - 1] if messages and messages[-1].get("role") == "assistant" else []
 
 
 def dedup_key(messages: list[dict[str, Any]]) -> str:

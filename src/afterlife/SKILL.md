@@ -21,9 +21,18 @@ structured output.
 
 ## What an experience is
 
-An experience is a short conversation. The **final assistant turn** is what the
-adapter learns to produce. The turns before it are the situation it learns to
-respond to.
+An experience is a conversation with one or more **target turns**: assistant
+turns the adapter learns to produce. Everything before a target turn is the
+situation it learns to respond to. By default the target is the final
+assistant turn. To pick particular turns instead, mark each one with
+`"train": true`. Each marked turn is learned separately, with the
+conversation up to that point as its context, and unmarked turns serve only
+as context.
+
+You can also write a short experience from scratch with just the exchange
+you care about. Either way, you decide which parts of a conversation are
+worth learning. A long conversation ending in "thanks!" / "you're welcome!"
+with nothing marked would teach only "you're welcome!".
 
 ```json
 {
@@ -39,9 +48,24 @@ respond to.
 }
 ```
 
-`tags`, `kind`, `priority`, `session_id` and `url` are optional. Write the
-final turn as the behaviour you want, not as a raw dump of what happened.
-If your model thinks before answering, put only the answer in the final turn.
+Marking turns in a longer conversation:
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": "How do I see old versions of a page?"},
+    {"role": "assistant", "content": "Use the Wayback Machine: ...", "train": true},
+    {"role": "user", "content": "Can I get notified when it changes?"},
+    {"role": "assistant", "content": "Check for an RSS feed: ...", "train": true},
+    {"role": "user", "content": "Thanks!"},
+    {"role": "assistant", "content": "You're welcome!"}
+  ]
+}
+```
+
+`tags`, `kind`, `priority`, `session_id` and `url` are optional. Write
+target turns as the behaviour you want, not as a raw dump of what happened.
+If your model thinks before answering, put only the answer in a target turn.
 Reasoning isn't trained on, and your thinking is left as it is.
 Don't include secrets, credentials or other people's personal details. Don't
 paste long copyrighted text either: the adapter may learn to reproduce it.

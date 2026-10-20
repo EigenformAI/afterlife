@@ -26,7 +26,7 @@ from typing import Any
 
 from afterlife.config import Config
 from afterlife.recipes import resolve_recipe, train_sft_kwargs
-from afterlife.selection import build_training_set, to_trainer_row
+from afterlife.selection import build_training_set, to_trainer_rows
 from afterlife.store import Store, new_id, utc_now
 
 
@@ -96,8 +96,8 @@ def prepare_run(store: Store, config: Config, request: dict[str, Any]) -> Path:
     run_id = new_id("run")
     run_dir = store.run_dir(run_id)
     run_dir.mkdir(parents=True)
-    _write_jsonl(run_dir / "train.jsonl", [to_trainer_row(e) for e in ts["train"]])
-    _write_jsonl(run_dir / "heldout.jsonl", [to_trainer_row(e) for e in ts["heldout"]])
+    _write_jsonl(run_dir / "train.jsonl", [r for e in ts["train"] for r in to_trainer_rows(e)])
+    _write_jsonl(run_dir / "heldout.jsonl", [r for e in ts["heldout"] for r in to_trainer_rows(e)])
     store.write_json(
         run_dir / "selection.json",
         {

@@ -16,7 +16,7 @@ from typing import Any
 
 from afterlife.config import Config
 from afterlife.policies import current_strategy, evaluate_policy, order_experiences
-from afterlife.schemas import check_messages, find_secrets
+from afterlife.schemas import check_messages, find_secrets, target_turns
 from afterlife.store import Store
 
 EXCLUDING_DECISIONS = {"reject", "defer", "external-memory-only"}
@@ -126,25 +126,31 @@ def build_training_set(store: Store, config: Config) -> dict[str, Any]:
             "train": len(train),
             "heldout": len(heldout),
             "train_chars": sum(e["chars"] for e in train),
+            "train_rows": sum(len(target_turns(e["training_candidate"]["messages"])) for e in train),
         },
     }
 
 
-def to_trainer_row(experience: dict[str, Any]) -> dict[str, Any]:
-    """Convert to the row format trainer.qlora reads: one prompt, one response.
+def to_trainer_rows(experience: dict[str, Any]) -> list[dict[str, Any]]:
+    """Convert to the row format trainer.qlora reads: one prompt, one response per row.
 
-    Earlier turns are folded into the prompt as a plain transcript, so the loss
-    lands only on the final assistant turn.
+    Each target turn (marked "train": true, else the final assistant turn)
+    becomes one row. Earlier turns are folded into its prompt as a plain
+    transcript, so the loss lands only on that turn.
     """
     messages = experience["training_candidate"]["messages"]
-    *context, final = messages
-    if len(context) == 1 and context[0]["role"] == "user":
-        prompt = context[0]["content"]
-    else:
-        prompt = "\n\n".join(f"[{m['role']}]\n{m['content']}" for m in context)
-    return {
-        "success": True,
-        "prompt": prompt,
-        "raw_response": final["content"],
-        "experience_id": experience["experience_id"],
-    }
+    rows = []
+    for i in target_turns(messages):
+        context = [{"role": m["role"], "content": m["content"]} for m in messages[:i]]
+        if len(context) == 1 and context[0]["role"] == "user":
+            prompt = context[0]["content"]
+        else:
+            prompt = "\n\n".join(f"[{m['role']}]\n{m['content']}" for m in context)
+        rows.append({
+            "success": True,
+            "prompt": prompt,
+            "raw_response": messages[i]["content"],
+            "experience_id": experience["experience_id"],
+            "turn": i,
+        })
+    return rows

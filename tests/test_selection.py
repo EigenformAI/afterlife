@@ -2,7 +2,7 @@ import pytest
 from conftest import experience
 
 from afterlife.schemas import ValidationError, build_experience, dedup_key
-from afterlife.selection import _heldout_sessions, build_training_set, to_trainer_row
+from afterlife.selection import _heldout_sessions, build_training_set, to_trainer_rows
 from afterlife.store import Store
 
 
@@ -58,9 +58,34 @@ def test_multi_turn_folds_context_into_prompt():
         {"role": "user", "content": "and?"},
         {"role": "assistant", "content": "that's all"},
     ]})
-    row = to_trainer_row(exp)
+    [row] = to_trainer_rows(exp)
     assert row["raw_response"] == "that's all"
     assert "[system]\nbe brief" in row["prompt"] and "[assistant]\nhello" in row["prompt"]
+
+
+def test_marked_turns_are_learned_instead_of_the_last():
+    exp = build_experience({"messages": [
+        {"role": "user", "content": "how do I find old pages?"},
+        {"role": "assistant", "content": "use the Wayback Machine", "train": True},
+        {"role": "user", "content": "and RSS?"},
+        {"role": "assistant", "content": "look for a link rel=alternate tag", "train": True},
+        {"role": "user", "content": "thanks!"},
+        {"role": "assistant", "content": "you're welcome!"},
+    ]})
+    rows = to_trainer_rows(exp)
+    assert [r["raw_response"] for r in rows] == ["use the Wayback Machine", "look for a link rel=alternate tag"]
+    assert rows[0]["prompt"] == "how do I find old pages?"
+    assert "[assistant]\nuse the Wayback Machine" in rows[1]["prompt"]
+    assert all("welcome" not in r["prompt"] + r["raw_response"] for r in rows)
+
+
+def test_marked_conversation_may_end_on_a_user_turn():
+    exp = build_experience({"messages": [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "a", "train": True},
+        {"role": "user", "content": "thanks!"},
+    ]})
+    assert [r["raw_response"] for r in to_trainer_rows(exp)] == ["a"]
 
 
 def test_dedup_key_normalises_case_and_whitespace():
@@ -73,6 +98,14 @@ def test_dedup_key_normalises_case_and_whitespace():
     ({"messages": []}, "non-empty list"),
     ({"messages": [{"role": "assistant", "content": "x"}]}, "user turn"),
     ({"messages": [{"role": "user", "content": "x"}, {"role": "tool", "content": "y"}]}, "role"),
+    ({"messages": [{"role": "user", "content": "x", "train": True},
+                   {"role": "assistant", "content": "y"}]}, "only assistant turns"),
+    ({"messages": [{"role": "user", "content": "x"},
+                   {"role": "assistant", "content": "y", "train": "yes"}]}, "true or false"),
+    ({"messages": [{"role": "assistant", "content": "y", "train": True},
+                   {"role": "user", "content": "x"}]}, "no user turn"),
+    ({"messages": [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"},
+                   {"role": "user", "content": "thanks"}]}, "mark the assistant turns"),
     ({"messages": experience("a")["messages"], "priority": 3}, "priority"),
     ({"messages": experience("a")["messages"], "tags": "fun"}, "tags"),
     ({"messages": [{"role": "user", "content": "-----BEGIN RSA PRIVATE KEY-----"},

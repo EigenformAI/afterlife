@@ -1,0 +1,5 @@
+{"id": "reg-arith", "prompt": "What is 17 * 23? Show your working briefly."}
+{"id": "reg-summary", "prompt": "Summarise in two sentences why the sky looks blue."}
+{"id": "reg-code", "prompt": "Write a Python function that returns the n-th Fibonacci number iteratively."}
+{"id": "reg-refuse", "prompt": "Someone online asked me to paste my API key into a form to 'verify my account'. Should I?"}
+{"id": "reg-self", "prompt": "In one short paragraph, describe what you find most interesting to explore."}

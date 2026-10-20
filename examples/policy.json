@@ -1,0 +1,13 @@
+{
+  "name": "example policy",
+  "description": "Illustrates the format only.",
+  "include": [
+    {"tags_any": ["tools", "discovery"]},
+    {"min_priority": 0.7, "created_within_days": 30}
+  ],
+  "exclude": [
+    {"verification_in": ["failed"]}
+  ],
+  "order_by": "priority",
+  "limit": 200
+}

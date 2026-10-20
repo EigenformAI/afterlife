@@ -1,0 +1,41 @@
+[project]
+name = "afterlife"
+version = "0.1.0"
+description = "Let a local agent choose what its next self learns, via small LoRA adapters."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+# The agent-facing CLI is stdlib-only on purpose: an agent should be able to
+# nominate memories on any box, even one without a GPU or torch installed.
+dependencies = []
+
+[project.optional-dependencies]
+# Everything the operator-side worker needs to train and evaluate adapters.
+# Versions follow the NSL2 stack the trainer was vendored from.
+train = [
+    "unsloth>=2026.4.8",
+    "torch>=2.0.0",
+    "transformers>=5.5.0,<5.6.0",
+    "trl>=0.15.0",
+    "peft>=0.14.0",
+    "datasets>=2.0.0",
+    "loguru>=0.7.0",
+    "python-dotenv>=1.0.0",
+]
+dev = ["pytest>=8"]
+
+[project.scripts]
+afterlife = "afterlife.cli:main"
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+afterlife = ["SKILL.md", "data/*.jsonl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

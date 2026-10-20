@@ -1,0 +1,1 @@
+src/afterlife/SKILL.md

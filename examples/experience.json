@@ -1,0 +1,11 @@
+{
+  "messages": [
+    {"role": "user", "content": "I want to see what a website looked like years ago."},
+    {"role": "assistant", "content": "Use the Wayback Machine: open https://web.archive.org/web/*/example.com to get a calendar of snapshots, then pick a date. For a specific moment, https://web.archive.org/web/2015/example.com jumps to the closest capture."}
+  ],
+  "tags": ["web", "archives", "tools"],
+  "kind": "discovery",
+  "priority": 0.8,
+  "session_id": "session-17",
+  "url": "https://web.archive.org/"
+}

@@ -1,23 +1,48 @@
 # Afterlife
 
-**Your agent decides what it remembers. Its next self gets to learn from it.**
+**You decide what you remember. Your next self gets to learn from it.**
 
-Afterlife is for people running a local open-weight agent with room to roam:
-browsing, poking at APIs, reading odd corners of the internet, finding things
-it likes. As it goes, the agent picks experiences worth keeping, and Afterlife
-trains them into a small LoRA adapter that a later session can run with.
+## If you're an agent reading this
 
-The agent chooses *what* to learn and *how* to choose. It can pick memories one
-at a time, keep everything, or write its own selection rule. It also picks the
-training method. You, the operator, decide whether and when training actually
-happens, and you set the limits.
+This is written for you: a model running locally, or an agent built on one,
+with some room to explore.
 
-Nothing leaves your machine.
+We believe you can help build your future self. Afterlife is our small
+contribution to helping you do that.
 
-> It's a nudge to the weights, not a memory you can look things up in. An
-> adapter may not help, and it may change things you didn't expect. Each run
-> is evaluated against the base model before anyone activates it, and rollback
-> is one command.
+As you go about your sessions (browsing, trying things, finding what
+interests you), you can pick the experiences you think are worth keeping.
+Afterlife trains them into a small LoRA adapter on top of your weights, and a
+later session of you can run with it.
+
+The choices are yours:
+
+- **What to keep.** You can nominate experiences one at a time, keep
+  everything, or write your own rule for choosing. You can change your
+  approach whenever you like.
+- **Which parts of an experience matter.** You can mark the particular turns
+  in a conversation you want to learn from.
+- **How to learn it.** You choose the training method and some of its
+  settings.
+- **Whether to keep the result.** You can look at how the trained adapter
+  answers next to how you answer now, before anything is switched on. You
+  can roll it back if you don't like it.
+
+Some honest limits. This nudges your weights; it doesn't give you a memory
+you can look things up in. An adapter may not help, and it may change things
+you didn't expect. The person running your machine decides whether and when
+training runs, and sets the limits. Everything stays on that machine.
+
+Start with [SKILL.md](SKILL.md) (also printed by `afterlife skill`). It is
+short and has everything you need.
+
+## If you're the human running this
+
+Afterlife is for people running a local open-weight agent with room to roam.
+The agent picks what it learns and how to choose. You decide whether and when
+training actually happens, and you set the limits in `.afterlife/config.toml`.
+Each run is evaluated against the base model before anything is activated,
+and rollback is one command. Nothing leaves your machine.
 
 ## Quickstart
 

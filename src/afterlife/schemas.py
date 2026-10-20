@@ -1,8 +1,9 @@
 """Experience records and their validation.
 
 An *experience* is something the agent might want its next self to learn from:
-a short conversation whose final assistant turn is the behaviour to learn.
-Whether it is actually selected is a separate *decision* (see decisions.jsonl),
+a short conversation whose target assistant turns are the behaviour to learn.
+An experience marked ``eval_only`` is never trained; it is used to check
+whether training on the others carries over to it. Whether it is actually selected is a separate *decision* (see decisions.jsonl),
 and whether it is actually trained on is decided later still, by the worker.
 """
 
@@ -151,6 +152,11 @@ def build_experience(payload: dict[str, Any]) -> dict[str, Any]:
     if kind is not None and not isinstance(kind, str):
         raise ValidationError(["kind must be a string"])
 
+    eval_only = payload.get("eval_only", False)
+    if not isinstance(eval_only, bool):
+        raise ValidationError(["eval_only must be true or false"])
+    embedded_decision(payload)  # validate before anything is stored
+
     return {
         "schema_version": SCHEMA_VERSION,
         "experience_id": payload.get("experience_id") or new_id("exp"),
@@ -159,10 +165,25 @@ def build_experience(payload: dict[str, Any]) -> dict[str, Any]:
         "kind": kind,
         "tags": sorted(set(tags)),
         "priority": priority,
+        "eval_only": eval_only,
         "training_candidate": {"messages": messages, "verification": verification},
         "dedup_key": dedup_key(messages),
         "chars": len(_messages_text(messages)),
     }
+
+
+def embedded_decision(payload: dict[str, Any]) -> tuple[str, str | None] | None:
+    """A decision carried inside the experience itself (brief format: selection.decision/reason)."""
+    selection = payload.get("selection") or {}
+    decision = payload.get("decision", selection.get("decision"))
+    reason = payload.get("reason", selection.get("reason"))
+    if decision is None:
+        return None
+    if decision not in DECISIONS:
+        raise ValidationError([f"decision must be one of {DECISIONS}"])
+    if reason is not None and not isinstance(reason, str):
+        raise ValidationError(["reason must be a string"])
+    return decision, reason
 
 
 def build_decision(

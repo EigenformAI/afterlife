@@ -209,7 +209,7 @@ def run_pending(store: Store, *, once: bool = True, dry_run: bool = False, poll_
                 try:
                     results.append({"request_id": request["request_id"], "ok": True,
                                     "manifest": process_request(store, request, dry_run=dry_run)})
-                except WorkerError as exc:
+                except Exception as exc:  # one bad request must not stop the queue
                     results.append({"request_id": request["request_id"], "ok": False, "error": str(exc)})
             if once:
                 return results

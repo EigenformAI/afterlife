@@ -5,7 +5,12 @@ LoRA rank 32 / alpha 32, batch 2 x grad-accum 4, linear schedule, 5 warmup steps
 seed 42, max_seq_length 4096, fixed completion mask (commit 216771c).
 
 Data: `make_dataset.py`. Three invented facts, each asked 8 ways, plus 4
-ordinary web tips: 24 train / 4 held-out rows, split by session. Probes:
+ordinary web tips, loaded with `add` under `--mode all`: 24 train / 4
+held-out rows, split by session. Every rephrasing of a fact has the same
+answer text, so held-out loss here measures recall of that exact answer under
+a new question. That is why SFT's held-out loss can reach ~0. With one-off
+memories it would mean much less. (Since this run, the split is re-drawn per
+request, so a re-run holds out different sessions.) Probes:
 3 fact questions (`probes.jsonl`) + 5 shipped regression prompts, greedy.
 Scored with `score_sweep.py`: recall = fraction of key phrases present in
 the probe answer; leaks = regression answers containing any fact term.

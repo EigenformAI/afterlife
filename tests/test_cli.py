@@ -99,6 +99,21 @@ def test_train_request_validation(home, cli, write_json):
     assert out["request"]["status"] == "pending"
 
 
+def test_brief_format_decision_and_reason_are_kept(home, cli, write_json):
+    def brief(text, decision):
+        return {"selection": {"decision": decision, "reason": f"because {text}"},
+                "training_candidate": {"messages": experience(text)["messages"]}}
+
+    _, out = cli("add", "--file", write_json([brief("no", "reject"), brief("yes", "nominate")]))
+    rejected, nominated = out["added"]
+    cli("policy", "set", "--mode", "all")
+    statuses = _ids(cli)
+    assert statuses[rejected] == "reject" and statuses[nominated] == "nominated"
+    _, out = cli("show", rejected)
+    assert out["decisions"][-1]["reason"] == "because no"
+    assert cli("add", "--file", write_json(brief("x", "maybe")))[0] == 2
+
+
 def test_disabled_method_is_refused(home, cli, write_json):
     cfg = home / "config.toml"
     cfg.write_text(cfg.read_text().replace('allowed_methods = ["sft", "dft", "asft"]', 'allowed_methods = ["asft"]'))
@@ -136,6 +151,18 @@ def test_worker_dry_run_freezes_selection(home, cli, write_json):
     assert code == 2
 
 
+def test_one_bad_request_does_not_stop_the_worker(home, cli, write_json):
+    cli("nominate", "--file", write_json(experience("a")))
+    cli("train", "--request", "--method", "sft")
+    cli("train", "--request", "--method", "asft")
+    cfg = home / "config.toml"
+    cfg.write_text(cfg.read_text().replace('allowed_methods = ["sft", "dft", "asft"]', 'allowed_methods = ["asft"]'))
+    code, out = cli("worker", "--dry-run")
+    assert code == 0
+    assert [r["ok"] for r in out["processed"]] == [False, True]
+    assert [r["status"] for r in Store(home).requests()] == ["failed", "dry_run"]
+
+
 def _fake_ready_run(home: Path, run_id: str, created_at: str) -> None:
     run_dir = home / "runs" / run_id
     (run_dir / "adapter").mkdir(parents=True)
@@ -159,6 +186,14 @@ def test_activate_and_rollback(home, cli):
     assert out["active"]["run_id"] is None
     assert not (home / "active-adapter").exists()
     assert "--enable-lora" not in cli("serve-cmd")[1]["command"]
+
+
+def test_rollback_to_a_run_that_is_not_ready_is_refused(home, cli, write_json):
+    cli("nominate", "--file", write_json(experience("a")))
+    cli("train", "--request", "--method", "asft")
+    run_id = cli("worker", "--dry-run")[1]["processed"][0]["manifest"]["run_id"]
+    assert cli("rollback", "--to", run_id)[0] == 2
+    assert Store(home).active().get("run_id") is None
 
 
 def test_operator_can_forbid_agent_activation(home, cli):

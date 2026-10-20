@@ -39,6 +39,36 @@ def test_budget_prefers_explicit_nominations(home, cli, write_json):
     assert sum(1 for r in ts["excluded"].values() if r.startswith("over budget")) == 2
 
 
+def _split(home, seed=""):
+    store = Store(home)
+    ts = build_training_set(store, store.config(), split_seed=seed)
+    return {e["experience_id"] for e in ts["train"]}, {e["experience_id"] for e in ts["heldout"]}
+
+
+def test_nominations_are_never_held_out(home, cli, write_json):
+    _, out = cli("nominate", "--file", write_json([experience(f"n{i}", session=f"s{i}") for i in range(10)]))
+    train, heldout = _split(home)
+    assert heldout == set() and train == set(out["nominated"])
+
+
+def test_eval_only_is_always_held_out_and_never_trained(home, cli, write_json):
+    cli("nominate", "--file", write_json(experience("mine")))
+    _, out = cli("add", "--file", write_json(experience("check", session="s2", eval_only=True)))
+    for mode in ("manual", "all"):
+        cli("policy", "set", "--mode", mode)
+        train, heldout = _split(home)
+        assert heldout == set(out["added"]) and not train & heldout
+
+
+def test_automatic_split_rotates_between_requests(home, cli, write_json):
+    cli("add", "--file", write_json([experience(f"a{i}", session=f"s{i}") for i in range(10)]))
+    cli("policy", "set", "--mode", "all")
+    splits = [_split(home, seed=f"req-{i}")[1] for i in range(5)]
+    assert all(len(h) == 2 for h in splits)  # ceil(0.15 * 10)
+    assert len({frozenset(h) for h in splits}) > 1
+    assert _split(home, seed="req-0")[1] == splits[0]  # stable for a given request
+
+
 def test_require_verified(home, cli, write_json):
     cfg = home / "config.toml"
     cfg.write_text(cfg.read_text().replace("require_verified = false", "require_verified = true"))
@@ -88,6 +118,11 @@ def test_marked_conversation_may_end_on_a_user_turn():
     assert [r["raw_response"] for r in to_trainer_rows(exp)] == ["a"]
 
 
+def test_eval_only_must_be_bool():
+    with pytest.raises(ValidationError, match="eval_only"):
+        build_experience(experience("a", eval_only="yes"))
+
+
 def test_dedup_key_normalises_case_and_whitespace():
     a = [{"role": "user", "content": "Hi  there"}, {"role": "assistant", "content": "Yo"}]
     b = [{"role": "user", "content": "hi there"}, {"role": "assistant", "content": " yo "}]
@@ -119,7 +154,7 @@ def test_experience_validation(payload, message):
 def test_nested_brief_format_is_accepted():
     exp = build_experience({
         "source": {"session_id": "session-17"},
-        "selection": {"tags": ["debugging"], "priority": 0.85, "reason": "ignored here"},
+        "selection": {"tags": ["debugging"], "priority": 0.85},
         "training_candidate": {"messages": experience("a")["messages"],
                                "verification": {"status": "unverified"}},
     })

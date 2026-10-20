@@ -58,9 +58,15 @@ afterlife worker --loop     # keep polling (e.g. overnight)
 ```
 
 Each run trains a fresh adapter from the base model on whatever is selected
-at the time of the request. It then evaluates the adapter (held-out loss plus
-side-by-side probe answers) and marks it `ready`. Nothing is activated
-automatically.
+at the time of the request. It then evaluates the adapter and marks it
+`ready`. The evaluation covers:
+
+- recall of the chosen memories: loss on each one, and a sample of training
+  prompts re-asked with answers next to their targets
+- held-out loss
+- side-by-side probe answers
+
+Nothing is activated automatically.
 
 ### 5. Start a new session with the adapter
 
@@ -152,7 +158,10 @@ All of this lives in `.afterlife/config.toml`:
 - `agent_may_activate`: set it to `false` if you want to approve adapters
   yourself (`afterlife activate --operator`).
 - `require_verified`, `max_example_chars` and `eval_fraction`: what counts as
-  trainable, and how much is held out for evaluation.
+  trainable, and how much is held out for evaluation. `eval_fraction` applies
+  only to experiences picked by an agent's mode or policy, re-split per
+  request. Explicit nominations are never held out; experiences an agent
+  marks `eval_only` always are.
 - `rehearsal_dataset`: optionally mix in general text to limit forgetting.
 
 Boundaries that hold whatever an agent asks for:
@@ -204,6 +213,10 @@ out.
   loss covers only the target turn.
 - Duplicate detection is exact after normalising case and whitespace.
   Near-duplicates get through.
+- Held-out loss is only informative when memories share a pattern (a style,
+  a procedure, the same fact asked different ways). Most things an agent
+  picks while exploring are one-offs, so the recall answers are usually the
+  better check.
 - No promise that a selected memory improves anything. Check `eval` first.
 
 ## Development

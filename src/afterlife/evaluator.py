@@ -1,10 +1,15 @@
 """Evaluate a freshly trained adapter against the base model and the current adapter.
 
-Two measurements, both cheap and judge-free:
+Three measurements, all judge-free:
 
-* held-out loss: mean completion NLL on experiences held out by session. Lower
-  means the adapter predicts the agent's own selected-but-unseen memories better.
-  Also reported on the training rows, so overfitting is visible.
+* memories: did it learn what was chosen? Completion NLL on each training
+  experience (base vs updated), plus greedy answers to a sample of the training
+  prompts shown next to the target. Loss alone can fall without recall, so the
+  answers are the thing to read.
+* held-out loss: mean completion NLL on held-out experiences (marked eval_only by
+  the agent, or split off from mode/policy picks). This only means something
+  when the held-out items share a pattern with the trained ones; a one-off
+  memory can't be predicted from the others.
 * probes: greedy answers to a few fixed prompts from each model variant, side by
   side. The shipped set checks for unrelated regressions; the agent may add its
   own in `.afterlife/probes.jsonl` to see whether its next self behaves differently.
@@ -36,27 +41,48 @@ def load_probes(store_root: Path) -> list[dict[str, Any]]:
     return [p for p in probes if isinstance(p.get("prompt"), str)]
 
 
-def _mean_completion_nll(
+def _completion_nll_rows(
     model: Any, tokenizer: Any, rows: list[dict[str, Any]], max_seq_length: int, max_rows: int
-) -> float | None:
+) -> list[tuple[float, int] | None]:
+    """(mean NLL, completion tokens) per row; None where nothing was scored."""
     import torch
 
     from afterlife.trainer.qlora import _build_completion_only_labels, _build_query_response_sft_row
 
-    total, count = 0.0, 0
+    out_rows: list[tuple[float, int] | None] = []
     for row in rows[:max_rows]:
         enc = _build_query_response_sft_row(tokenizer, prompt=row["prompt"], raw_response=row["raw_response"])
         ids = enc["input_ids"][:max_seq_length]
         labels = _build_completion_only_labels(input_ids=ids, completion_mask=enc["completion_mask"][:max_seq_length])
         n = sum(1 for l in labels[1:] if l != -100)
         if n == 0:
+            out_rows.append(None)
             continue
         device = next(model.parameters()).device
         with torch.no_grad():
             out = model(input_ids=torch.tensor([ids], device=device), labels=torch.tensor([labels], device=device))
-        total += float(out.loss) * n
-        count += n
-    return total / count if count else None
+        loss = float(out.loss)
+        out_rows.append((loss, n) if math.isfinite(loss) else None)
+    return out_rows
+
+
+def _mean(scored: list[tuple[float, int] | None]) -> float | None:
+    pairs = [s for s in scored if s is not None]
+    count = sum(n for _, n in pairs)
+    return sum(l * n for l, n in pairs) / count if count else None
+
+
+def _per_memory(rows: list[dict[str, Any]], scored: dict[str, list[tuple[float, int] | None]]) -> list[dict[str, Any]]:
+    """Loss per training experience for each variant, rows of one experience pooled."""
+    by_exp: dict[str, list[int]] = {}
+    for i, row in enumerate(rows[: len(scored["base"])]):
+        by_exp.setdefault(row.get("experience_id", str(i)), []).append(i)
+    out = []
+    for eid, idx in by_exp.items():
+        loss = {name: _mean([s[i] for i in idx]) for name, s in scored.items()}
+        out.append({"experience_id": eid, "turns": len(idx),
+                    "loss": {k: (round(v, 4) if v is not None else None) for k, v in loss.items()}})
+    return out
 
 
 def split_thinking(text: str) -> dict[str, str | None]:
@@ -136,30 +162,46 @@ def evaluate_run(run_dir: Path) -> dict[str, Any]:
     train_rows = _read_jsonl(run_dir / "train.jsonl")
     heldout_rows = _read_jsonl(run_dir / "heldout.jsonl")
     probes = load_probes(store_root)
+    # One training turn per experience first, so the sample covers as many memories as possible.
+    recall_rows: list[dict[str, Any]] = []
+    for row in train_rows:
+        if len(recall_rows) < eval_cfg.recall_rows and row.get("experience_id") not in {
+            r.get("experience_id") for r in recall_rows
+        }:
+            recall_rows.append(row)
 
     losses: dict[str, dict[str, float | None]] = {}
+    train_scored: dict[str, list[tuple[float, int] | None]] = {}
     answers: dict[str, dict[str, Any]] = {p.get("id", str(i)): {} for i, p in enumerate(probes)}
+    recall_answers: list[dict[str, Any]] = [{} for _ in recall_rows]
     n_loss = eval_cfg.max_loss_rows
     for name in variants:
         with use(name):
+            train_scored[name] = _completion_nll_rows(model, tokenizer, train_rows, max_seq, n_loss)
             losses[name] = {
-                "heldout": _mean_completion_nll(model, tokenizer, heldout_rows, max_seq, n_loss),
-                "train": _mean_completion_nll(model, tokenizer, train_rows, max_seq, n_loss),
+                "heldout": _mean(_completion_nll_rows(model, tokenizer, heldout_rows, max_seq, n_loss)),
+                "train": _mean(train_scored[name]),
             }
-            texts = _generate(model, tokenizer, [p["prompt"] for p in probes], eval_cfg.probe_max_new_tokens)
+            texts = _generate(model, tokenizer, [p["prompt"] for p in probes] + [r["prompt"] for r in recall_rows],
+                              eval_cfg.probe_max_new_tokens)
             for i, (p, text) in enumerate(zip(probes, texts)):
                 answers[p.get("id", str(i))][name] = split_thinking(text)
+            for slot, text in zip(recall_answers, texts[len(probes):]):
+                slot[name] = split_thinking(text)
 
-    for split in losses.values():
-        for k, v in split.items():
-            if v is not None and not math.isfinite(v):
-                split[k] = None
+    memories = _per_memory(train_rows, train_scored)
+    scored_both = [m for m in memories if m["loss"]["base"] is not None and m["loss"]["updated"] is not None]
 
     def delta(split: str, ref: str) -> float | None:
         a, b = losses["updated"][split], losses.get(ref, {}).get(split)
         return None if a is None or b is None else round(a - b, 4)
 
     summary = {
+        "memories": {
+            "trained": len(memories),
+            "loss_fell_vs_base": sum(1 for m in scored_both if m["loss"]["updated"] < m["loss"]["base"]),
+            "recall_samples": len(recall_rows),
+        },
         "loss": losses,
         "heldout_loss_change_vs_base": delta("heldout", "base"),
         "heldout_loss_change_vs_current": delta("heldout", "current"),
@@ -171,13 +213,20 @@ def evaluate_run(run_dir: Path) -> dict[str, Any]:
             for name in variants
         },
         "probe_max_new_tokens": eval_cfg.probe_max_new_tokens,
-        "note": "Negative loss change = updated adapter predicts those memories better. "
-        "Read the probe answers before activating; loss does not show regressions on its own.",
+        "note": "Negative loss change = updated adapter predicts those memories better. Lower loss "
+        "does not always mean recall: compare the recall answers with their targets, and read the "
+        "probe answers for regressions, before activating.",
     }
     report = {
         "run_id": manifest["run_id"],
         "variants": {k: (str(v) if v else None) for k, v in variants.items()},
         "summary": summary,
+        "memories": memories,
+        "recall": [
+            {"experience_id": r.get("experience_id"), "turn": r.get("turn"), "prompt": r["prompt"],
+             "target": r["raw_response"], "answers": a}
+            for r, a in zip(recall_rows, recall_answers)
+        ],
         "probes": [
             {"id": p.get("id", str(i)), "source": p["source"], "prompt": p["prompt"],
              "answers": answers[p.get("id", str(i))]}

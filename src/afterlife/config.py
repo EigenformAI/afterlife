@@ -37,6 +37,9 @@ max_seq_length = 4096
 probe_max_new_tokens = 2048
 # Held-out / train rows scored for loss (each is one forward pass per variant).
 max_loss_rows = 200
+# Training prompts re-asked after training, answers shown next to the target
+# (one turn per experience, first ones first).
+recall_rows = 8
 
 [operator]
 # Master switch for the training worker.
@@ -52,7 +55,9 @@ max_steps = 300
 min_minutes_between_runs = 0
 # Drop candidates whose verification.status is not "verified".
 require_verified = false
-# Fraction of sessions held out for evaluation (split by session, not row).
+# Fraction of sessions held out for evaluation, applied only to experiences
+# picked by the agent's mode or policy. Explicit nominations are never held
+# out; eval_only experiences always are. Re-split for every request.
 eval_fraction = 0.15
 # Max characters per training example (all messages together).
 max_example_chars = 12000
@@ -104,6 +109,7 @@ class OperatorConfig:
 class EvalConfig:
     probe_max_new_tokens: int = 2048
     max_loss_rows: int = 200
+    recall_rows: int = 8
 
 
 @dataclass

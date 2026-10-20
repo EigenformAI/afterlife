@@ -17,7 +17,7 @@ from afterlife import __version__
 from afterlife.config import DEFAULT_BASE_MODEL, ConfigError, render_default_config
 from afterlife.policies import PolicyError, current_strategy, set_strategy, validate_policy
 from afterlife.recipes import RecipeError, describe_methods, parse_param, resolve_recipe
-from afterlife.schemas import ValidationError, build_decision, build_experience
+from afterlife.schemas import ValidationError, build_decision, build_experience, embedded_decision
 from afterlife.selection import build_training_set, select
 from afterlife.store import Store, find_root, new_id, utc_now
 
@@ -60,10 +60,11 @@ def _ingest(store: Store, path: str) -> list[dict[str, Any]]:
     payload = _load_payload(path)
     items = payload if isinstance(payload, list) else [payload]
     known = store.experience_ids()
-    records = []
+    records, decisions = [], []
     for i, item in enumerate(items):
         try:
             record = build_experience(item)
+            decisions.append(embedded_decision(item))
         except ValidationError as exc:
             where = f"item {i}: " if len(items) > 1 else ""
             raise CliError(f"{where}{exc}", EXIT_INPUT, problems=exc.problems) from exc
@@ -73,6 +74,9 @@ def _ingest(store: Store, path: str) -> list[dict[str, Any]]:
         records.append(record)
     for record in records:
         store.append(store.experiences_path, record)
+    for record, decision in zip(records, decisions):
+        if decision:
+            _decide(store, [record["experience_id"]], decision[0], decision[1])
     return records
 
 
@@ -116,6 +120,8 @@ def _statuses(store: Store) -> dict[str, str]:
             out[eid] = "trained" if eid in selected else "trained-previously"
         elif d and d != "nominate":
             out[eid] = d
+        elif e.get("eval_only"):
+            out[eid] = "eval-only"
         elif eid in selected:
             out[eid] = "nominated" if d == "nominate" else "selected"
         else:
@@ -241,7 +247,12 @@ def cmd_preview(args: argparse.Namespace) -> dict[str, Any]:
         key = r.split(":")[0] if not r.startswith("duplicate") else "duplicate"
         reasons[key] = reasons.get(key, 0) + 1
     return {"mode": ts["mode"], "policy_hash": ts["policy_hash"], "counts": ts["counts"],
-            "excluded_by_reason": reasons}
+            "excluded_by_reason": reasons,
+            "heldout_ids": [e["experience_id"] for e in ts["heldout"]],
+            "note": "Held-out experiences are used for eval, not trained. Experiences you mark "
+                    "eval_only are always held out; nominated ones never are. Others picked by "
+                    "the mode or policy are split afresh for each request, so this list can differ "
+                    "from the one a request gets."}
 
 
 def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
@@ -256,12 +267,13 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
         recipe = resolve_recipe(config, args.method, overrides)
     except RecipeError as exc:
         raise CliError(str(exc), EXIT_REFUSED if "operator" in str(exc) else EXIT_INPUT) from exc
-    ts = build_training_set(store, config)
+    request_id = new_id("req")
+    ts = build_training_set(store, config, split_seed=request_id)
     if not ts["train"]:
         raise CliError("nothing would be trained: the current selection is empty", EXIT_INPUT,
                        counts=ts["counts"])
     request = {
-        "request_id": new_id("req"), "created_at": utc_now(), "updated_at": utc_now(),
+        "request_id": request_id, "created_at": utc_now(), "updated_at": utc_now(),
         "status": "pending", "method": args.method, "params": overrides, "note": args.note,
         "strategy_at_request": {"mode": ts["mode"], "policy_hash": ts["policy_hash"]},
         "counts_at_request": ts["counts"],
@@ -361,9 +373,12 @@ def cmd_rollback(args: argparse.Namespace) -> dict[str, Any]:
         target = earlier[-1] if earlier else None
     else:
         try:
-            target = store.resolve_run(args.to)["run_id"]
+            manifest = store.resolve_run(args.to)
         except LookupError as exc:
             raise CliError(str(exc), EXIT_NOT_FOUND) from exc
+        if manifest["status"] != "ready":
+            raise CliError(f"run {manifest['run_id']} is {manifest['status']}, not ready", EXIT_INPUT)
+        target = manifest["run_id"]
     result = _set_active(store, target, actor, "rollback")
     return {"active": result, "message": "takes effect in the next session"}
 
@@ -457,7 +472,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = add("list", cmd_list, "list experiences and their status")
     sp.add_argument("--status", choices=("eligible", "nominated", "selected", "trained",
-                                         "trained-previously", "reject", "defer", "external-memory-only"))
+                                         "trained-previously", "eval-only", "reject", "defer",
+                                         "external-memory-only"))
     sp.add_argument("--tag")
     sp.add_argument("--limit", type=int, default=50)
 

@@ -3,7 +3,13 @@
     eligible   every stored experience
     selected   what the agent's decisions + current mode/policy pick
     validated  selected minus structural/length/verification failures and duplicates
-    trained    validated, split by session into train vs held-out, capped by budget
+    trained    validated, minus held-out, capped by budget
+
+Held-out data comes from two places. Experiences the agent marks eval_only are
+always held out and never trained. Experiences picked by the mode or policy
+(not nominated one by one) are split by session, a fresh split per request, so
+nothing is held out every time. Explicit nominations are never held out: if
+the agent chose it, it gets trained.
 
 Every excluded experience gets a reason, so `selected != trained` is visible.
 """
@@ -28,15 +34,17 @@ def select(store: Store, strategy: dict[str, Any] | None = None) -> dict[str, An
     experiences = store.experiences()
     latest = store.latest_decisions()
 
-    explicit_in, undecided, excluded = [], [], {}
+    explicit_in, undecided, eval_only, excluded = [], [], [], {}
     for e in experiences:
         d = latest.get(e["experience_id"])
-        if d is None:
-            undecided.append(e)
-        elif d["decision"] == "nominate":
-            explicit_in.append(e)
-        else:
+        if d is not None and d["decision"] in EXCLUDING_DECISIONS:
             excluded[e["experience_id"]] = f"decision: {d['decision']}"
+        elif e.get("eval_only"):
+            eval_only.append(e)
+        elif d is None:
+            undecided.append(e)
+        else:
+            explicit_in.append(e)
 
     mode = strategy["mode"]
     if mode == "manual":
@@ -57,31 +65,33 @@ def select(store: Store, strategy: dict[str, Any] | None = None) -> dict[str, An
         "eligible": experiences,
         "selected": explicit_in + auto,
         "explicit_ids": [e["experience_id"] for e in explicit_in],
+        "eval_only": eval_only,
         "excluded": excluded,
     }
 
 
-def _heldout_sessions(experiences: list[dict[str, Any]], fraction: float) -> set[str]:
+def _heldout_sessions(experiences: list[dict[str, Any]], fraction: float, seed: str = "") -> set[str]:
     """Pick ceil(fraction * n) sessions by hash; at least one when there are >= 2.
 
     Splitting by session keeps paraphrases of one episode on the same side.
-    Experiences without a session_id count as their own session.
+    Experiences without a session_id count as their own session. The seed
+    (the request id) rotates which sessions are held out from run to run.
     """
     keys = sorted({e["source"].get("session_id") or e["experience_id"] for e in experiences})
     if fraction <= 0 or len(keys) < 2:
         return set()
     n = min(len(keys) - 1, max(1, math.ceil(fraction * len(keys))))
-    ranked = sorted(keys, key=lambda k: hashlib.sha256(k.encode()).hexdigest())
+    ranked = sorted(keys, key=lambda k: hashlib.sha256(f"{seed}:{k}".encode()).hexdigest())
     return set(ranked[:n])
 
 
-def build_training_set(store: Store, config: Config) -> dict[str, Any]:
+def build_training_set(store: Store, config: Config, split_seed: str = "") -> dict[str, Any]:
     sel = select(store)
     op = config.operator
     excluded = dict(sel["excluded"])
     seen: dict[str, str] = {}
     valid = []
-    for e in sel["selected"]:
+    for e in sel["selected"] + sel["eval_only"]:
         eid = e["experience_id"]
         messages = e["training_candidate"]["messages"]
         problems = check_messages(messages)
@@ -99,14 +109,20 @@ def build_training_set(store: Store, config: Config) -> dict[str, Any]:
             seen[e["dedup_key"]] = eid
             valid.append(e)
 
-    held = _heldout_sessions(valid, op.eval_fraction)
+    explicit = set(sel["explicit_ids"])
+    eval_ids = {e["experience_id"] for e in sel["eval_only"]}
+    splittable = [e for e in valid if e["experience_id"] not in explicit | eval_ids]
+    held = _heldout_sessions(splittable, op.eval_fraction, split_seed)
     train, heldout = [], []
     for e in valid:
-        key = e["source"].get("session_id") or e["experience_id"]
-        (heldout if key in held else train).append(e)
+        eid = e["experience_id"]
+        key = e["source"].get("session_id") or eid
+        if eid in eval_ids or (eid not in explicit and key in held):
+            heldout.append(e)
+        else:
+            train.append(e)
 
     # Budget: explicit nominations first, then by priority / recency.
-    explicit = set(sel["explicit_ids"])
     ordered = order_experiences(train, "priority")
     ordered.sort(key=lambda e: e["experience_id"] not in explicit)
     for e in ordered[op.max_examples_per_run :]:
@@ -125,6 +141,7 @@ def build_training_set(store: Store, config: Config) -> dict[str, Any]:
             "validated": len(valid),
             "train": len(train),
             "heldout": len(heldout),
+            "heldout_eval_only": sum(1 for e in heldout if e["experience_id"] in eval_ids),
             "train_chars": sum(e["chars"] for e in train),
             "train_rows": sum(len(target_turns(e["training_candidate"]["messages"])) for e in train),
         },

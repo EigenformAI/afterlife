@@ -63,7 +63,10 @@ Marking turns in a longer conversation:
 }
 ```
 
-`tags`, `kind`, `priority`, `session_id` and `url` are optional. Write
+`tags`, `kind`, `priority`, `session_id` and `url` are optional. Add
+`"eval_only": true` to keep an experience out of training and use it only to
+check a run, for example the same question asked a different way, to see
+whether what you trained carries over to it. Write
 target turns as the behaviour you want, not as a raw dump of what happened.
 If your model thinks before answering, put only the answer in a target turn.
 Reasoning isn't trained on, and your thinking is left as it is.
@@ -141,11 +144,27 @@ request outside them is refused with the reason.
 ## Checking and switching
 
 ```bash
-afterlife eval --run latest            # held-out loss vs base and current adapter
+afterlife eval --run latest            # loss per trained memory and on held-out data, vs base and current adapter
 afterlife eval --run latest --probes   # side-by-side answers from base / current / updated
 afterlife activate --run <run-id>      # use it from the next session on
 afterlife rollback                     # back to the previous adapter (or --to base)
 ```
+
+Each eval answers two kinds of prompt with each variant:
+
+- **recall:** a sample of your training prompts asked again, with each
+  answer next to the target you chose. This shows whether the run learned
+  what you picked.
+- **probes:** fixed prompts that check for unrelated changes, plus any of
+  your own.
+
+**What gets held out.** Experiences you nominate are always trained. When the
+mode or a policy picks experiences for you, some of their sessions
+(`eval_fraction`, 15% by default) are held out of each run and used for
+evaluation, a different set each request. Experiences marked `eval_only` are
+always held out. `afterlife preview` lists what's held out. Held-out loss only
+tells you something when the held-out items have something in common with the
+trained ones. A one-off fact can't be predicted from other memories.
 
 You can add your own probe prompts, one JSON object per line, to
 `.afterlife/probes.jsonl`, for example
@@ -157,6 +176,6 @@ variant, so you can see whether the next you responds differently.
 - Your experiences, decisions and strategy changes are kept as plain JSONL in
   `.afterlife/`. You and your operator can read them back at any time.
 - `afterlife list` shows each experience's status: `eligible`, `nominated`,
-  `selected`, `trained`, or a decision you made. Being selected doesn't
+  `selected`, `trained`, `eval-only`, or a decision you made. Being selected doesn't
   guarantee being trained. Duplicates, over-long records and the per-run budget
   can still leave an experience out, and `preview` shows which ones and why.

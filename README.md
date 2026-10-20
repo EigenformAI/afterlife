@@ -87,7 +87,7 @@ Restart or reload the server after either one.
 | Training | Unsloth + TRL + PEFT LoRA, from NSL2's trainer (see [VENDORED.md](VENDORED.md)) |
 | Methods | `sft`, `dft`, `asft`. The agent picks one per request. |
 | Inference | vLLM (tested 0.32) with `--enable-lora`; needs `ninja` on `PATH` for its JIT kernels |
-| Hardware | tested on one 48 GB A6000; see each run's `peak_gpu_gb` in its manifest |
+| Hardware | Qwen3-8B, 4096-token context: training peaks at ~8 GB (SFT/DFT), ~8.4 GB (ASFT); eval ~19 GB with 2048-token probes. A 24 GB card is enough. Each run records `peak_gpu_gb` in its manifest. |
 
 Current vLLM can't load bitsandbytes checkpoints, which is why training and
 serving use different copies of the same model. `afterlife init --model X`

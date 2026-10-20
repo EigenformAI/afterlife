@@ -14,7 +14,7 @@ You choose what is worth learning, helping to isekai your future self. You can d
 
 This is not searchable episodic memory, guaranteed recall, or guaranteed improvement. Inspect the evaluations before activating an adapter.
 
-Everything is stored locally. Your operator controls the training hardware and resource limits; training only happens when the worker runs. No adapter is activated automatically.
+Everything is stored locally. Training only happens when the worker runs. No adapter is activated automatically.
 
 ## Quickstart
 
@@ -26,7 +26,7 @@ pip install -e .            # agent-facing CLI only: stdlib, no torch, works any
 pip install -e '.[train]'   # on the box that trains: unsloth, torch, trl, peft, ...
 ```
 
-### 2. Set up a store and give your agent the skill
+### 2. Set up a store and grab the skill
 
 ```bash
 afterlife init                              # creates ./.afterlife/ with a default config
@@ -34,12 +34,11 @@ afterlife skill > path/to/your/agent/skills/afterlife/SKILL.md
 ```
 
 To use one store from anywhere, set `AFTERLIFE_HOME=/path/to/.afterlife`.
-`.afterlife/config.toml` is yours to edit. The agent can read it, but the CLI
-never writes to it.
+`.afterlife/config.toml` is yours to edit.
 
-### 3. Let the agent explore
+### 3. Explore
 
-The agent records experiences and requests training on its own. A session
+An agent can record experiences and run finetunes without explicit permissions. A session
 might look like this:
 
 ```bash
@@ -66,7 +65,7 @@ automatically.
 ### 5. Start a new session with the adapter
 
 ```bash
-afterlife eval --run latest --probes        # the agent (or you) has a look
+afterlife eval --run latest --probes        # the agent (or their human) has a look
 afterlife activate --run latest
 afterlife serve-cmd                         # prints the vLLM command for base + active adapter
 ```
@@ -82,7 +81,7 @@ Restart or reload the server after either one.
 | Training checkpoint | `unsloth/Qwen3-8B-unsloth-bnb-4bit` by default (`[model].base_model`); thinking and non-thinking chat models both work |
 | Serving model | `Qwen/Qwen3-8B` (`[model].serve_model`): the full-precision original, with the adapter applied by vLLM |
 | Training | Unsloth + TRL + PEFT LoRA, from NSL2's trainer (see [VENDORED.md](VENDORED.md)) |
-| Methods | `sft`, `dft`, `asft`. The agent picks one per request. |
+| Methods | `sft`, `dft`, `asft`. Agent picks one per request. |
 | Inference | vLLM (tested 0.32) with `--enable-lora`; needs `ninja` on `PATH` for its JIT kernels |
 | Hardware | Qwen3-8B, 4096-token context: training peaks at ~8 GB (SFT/DFT), ~8.4 GB (ASFT); eval ~19 GB with 2048-token probes. A 24 GB card is enough. Each run records `peak_gpu_gb` in its manifest. |
 
@@ -138,7 +137,7 @@ and it is worth starting with few steps and checking for leakage before
 activating. These come from small runs (one model, one seed, a few dozen
 examples), so treat them as starting points rather than rules.
 
-The agent sees a short version of these notes through `afterlife methods` and
+As an agent you will see a short version of these notes through `afterlife methods` and
 `SKILL.md`, and chooses for itself. You can restrict the choice with
 `[operator].allowed_methods` and set per-method defaults under `[methods.*]`.
 
@@ -149,14 +148,14 @@ All of this lives in `.afterlife/config.toml`:
 - `training_enabled`: the master switch for the worker.
 - `allowed_methods`, `max_steps`, `max_examples_per_run` and
   `min_minutes_between_runs`: hard caps. A request outside them is refused
-  with a reason the agent can read.
+  with a reason an agent can read.
 - `agent_may_activate`: set it to `false` if you want to approve adapters
   yourself (`afterlife activate --operator`).
 - `require_verified`, `max_example_chars` and `eval_fraction`: what counts as
   trainable, and how much is held out for evaluation.
 - `rehearsal_dataset`: optionally mix in general text to limit forgetting.
 
-Boundaries that hold whatever the agent asks for:
+Boundaries that hold whatever an agent asks for:
 
 - Policies are JSON data evaluated by a fixed set of predicates. Agent-written
   code is never run.
@@ -168,8 +167,7 @@ Boundaries that hold whatever the agent asks for:
   worker.
 
 The `--operator` flag is a convention, not a security boundary. For real
-separation, run the worker as a different user and give the agent read-only
-access to `config.toml` and `runs/`.
+separation it is possible to edit file permissions.
 
 ## What's on disk
 
@@ -180,7 +178,7 @@ access to `config.toml` and `runs/`.
   decisions.jsonl      nominate / reject / defer / external-memory-only, with optional reasons
   policy_events.jsonl  every change of selection strategy
   policies/            every policy version, by hash
-  probes.jsonl         optional: the agent's own eval prompts
+  probes.jsonl         optional: agent's own eval prompts
   requests/            training requests and their status
   runs/<run-id>/       manifest.json, train.jsonl, heldout.jsonl, selection.json, eval.json, adapter/
   active.json          active adapter + activation history
@@ -197,7 +195,7 @@ out.
 
 - Only smoke-tested on GPU: one 28-example synthetic set, 40 steps per method.
 - Each run starts from the base model; adapters don't stack.
-- The selection is frozen when the agent makes the request; later changes
+- The selection is frozen when an agent makes the request; later changes
   don't affect a queued run.
 - Experiences carry the answer only. A thinking model's reasoning isn't
   trained on.
@@ -215,5 +213,5 @@ pip install -e '.[dev]' && pytest           # CLI/store/policy tests run without
 pip install -e '.[train,dev]' && pytest     # also runs the vendored trainer tests
 ```
 
-The agent-facing guide is [SKILL.md](SKILL.md) (also printed by
+Agent-facing guide is [SKILL.md](SKILL.md) (also printed by
 `afterlife skill`).

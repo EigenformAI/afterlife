@@ -14,17 +14,21 @@ from afterlife.config import Config
 METHODS: dict[str, dict[str, str]] = {
     "sft": {
         "summary": "Standard supervised fine-tuning (cross-entropy on the final assistant turn).",
-        "notes": "Fast and simple. In NSL experiments it was sensitive to learning rate and step count: "
-        "too much and it overwrites unrelated behaviour, too little and nothing sticks.",
+        "notes": "The only one of the three that learned genuinely new facts in our tests, but hard to dose: "
+        "a little too little and nothing sticks, a little too much and the new material leaks into "
+        "unrelated answers. Sensitive to learning rate and step count.",
     },
     "dft": {
         "summary": "Dynamic fine-tuning: cross-entropy weighted by the model's own token probability.",
-        "notes": "Down-weights tokens the model finds very unlikely, which tends to make updates gentler than SFT.",
+        "notes": "Down-weights tokens the model finds unlikely. Good at reinforcing things you already "
+        "half-do; poor at new facts (in our tests it learned the shape of answers but not their content, "
+        "and degraded at high learning rate x steps).",
     },
     "asft": {
         "summary": "Anchored SFT: DFT plus a KL penalty that keeps the adapter close to the base model.",
-        "notes": "In NSL experiments it tolerated a much wider range of hyperparameters than SFT. "
-        "Costs extra compute for the reference forward pass. asft_kl_weight=0 reduces it to DFT.",
+        "notes": "Tolerated a much wider range of hyperparameters than SFT and stayed stable in every "
+        "setting we tried. Best for refining existing behaviour; in our tests it did not pick up new "
+        "facts within 150 steps. Costs an extra forward pass per step. asft_kl_weight=0 reduces it to DFT.",
     },
 }
 

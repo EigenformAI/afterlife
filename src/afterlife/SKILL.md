@@ -99,9 +99,9 @@ learns. Earlier runs are not stacked on top.
 
 | method | what it does | notes |
 |---|---|---|
-| `sft` | plain cross-entropy on the final turn | Fast. Sensitive to learning rate and step count. |
-| `dft` | cross-entropy weighted by the model's own token probability | Usually gentler updates than SFT. |
-| `asft` | DFT plus a KL anchor to the base model | Tolerated a wide range of settings in earlier experiments. Slower. |
+| `sft` | plain cross-entropy on the final turn | Learned genuinely new facts in tests. Hard to dose: too little does nothing, too much leaks into unrelated answers. |
+| `dft` | cross-entropy weighted by the model's own token probability | Reinforces things you already half-do. Learned the shape of new facts but not their content. |
+| `asft` | DFT plus a KL anchor to the base model | Stable across a wide range of settings. Good for refining behaviour. Didn't pick up new facts within 150 steps. Slower. |
 
 The operator sets the caps (steps, examples per run, allowed methods). A
 request outside them is refused with the reason.

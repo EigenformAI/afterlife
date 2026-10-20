@@ -7,6 +7,7 @@ below is rejected rather than silently clamped, so the agent learns the limits.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from afterlife.config import Config
@@ -32,11 +33,15 @@ METHODS: dict[str, dict[str, str]] = {
     },
 }
 
+# Each optimizer step sees BATCH_SIZE x GRAD_ACCUM rows; passed to the trainer
+# explicitly so passes-per-example below stays true.
+BATCH_SIZE, GRAD_ACCUM = 2, 4
+
 # name -> (type, lo, hi, methods it applies to or None for all)
 PARAM_BOUNDS: dict[str, tuple[type, float, float, tuple[str, ...] | None]] = {
     "learning_rate": (float, 1e-6, 1e-3, None),
     "max_steps": (int, 1, 10_000, None),  # further capped by [operator].max_steps
-    "num_train_epochs": (int, 1, 10, None),
+    "epochs": (float, 0.1, 100, None),  # passes over the training rows; sets max_steps
     "lora_rank": (int, 4, 64, None),  # 64 matches the vLLM --max-lora-rank we document
     "lora_alpha": (int, 1, 256, None),
     "warmup_steps": (int, 0, 1000, None),
@@ -47,6 +52,21 @@ PARAM_BOUNDS: dict[str, tuple[type, float, float, tuple[str, ...] | None]] = {
 
 class RecipeError(Exception):
     pass
+
+
+def steps_per_pass(train_rows: int) -> int:
+    """Optimizer steps for one pass over train_rows (the last step of a pass may be partial)."""
+    return max(1, math.ceil(math.ceil(train_rows / BATCH_SIZE) / GRAD_ACCUM))
+
+
+def rows_per_pass(config: Config, train_rows: int) -> int:
+    """Rows in one pass: the selection's target turns plus any rehearsal rows."""
+    op = config.operator
+    return train_rows + (op.rehearsal_rows_per_epoch if op.rehearsal_dataset else 0)
+
+
+def passes_per_example(max_steps: int, train_rows: int) -> float:
+    return round(max_steps / steps_per_pass(train_rows), 2) if train_rows else 0.0
 
 
 def describe_methods(config: Config) -> dict[str, Any]:
@@ -64,6 +84,10 @@ def describe_methods(config: Config) -> dict[str, Any]:
             "max_steps": config.operator.max_steps,
             "max_examples_per_run": config.operator.max_examples_per_run,
         },
+        "steps_and_passes": f"Each step trains on {BATCH_SIZE * GRAD_ACCUM} rows (one row per target turn). "
+        "With a fixed max_steps, a small selection is seen many times and a large one only a few: "
+        "`preview` and `train --request` report passes_per_example. Set epochs instead of max_steps "
+        "to fix the number of passes; the steps are then worked out from the selection.",
     }
 
 
@@ -82,8 +106,14 @@ def parse_param(text: str) -> tuple[str, Any]:
     return key, value
 
 
-def resolve_recipe(config: Config, method: str, overrides: dict[str, Any]) -> dict[str, Any]:
-    """Merge operator defaults with agent overrides; validate against bounds and caps."""
+def resolve_recipe(
+    config: Config, method: str, overrides: dict[str, Any], train_rows: int | None = None
+) -> dict[str, Any]:
+    """Merge operator defaults with agent overrides; validate against bounds and caps.
+
+    ``epochs`` is turned into max_steps using ``train_rows``; without it (no
+    selection known yet) only the bounds are checked.
+    """
     if method not in METHODS:
         raise RecipeError(f"unknown method {method!r}; choose from {', '.join(METHODS)}")
     if method not in config.operator.allowed_methods:
@@ -104,13 +134,27 @@ def resolve_recipe(config: Config, method: str, overrides: dict[str, Any]) -> di
             raise RecipeError(f"{key}={value} outside [{lo}, {hi}]")
         params[key] = kind(value)
 
+    if "epochs" in overrides and "max_steps" in overrides:
+        raise RecipeError("set epochs or max_steps, not both")
+    cap = config.operator.max_steps
+    if "epochs" in params and train_rows:
+        if "max_steps" not in overrides:
+            params["max_steps"] = max(1, math.ceil(params["epochs"] * steps_per_pass(train_rows)))
+        if params["max_steps"] > cap:
+            most = cap / steps_per_pass(train_rows)
+            raise RecipeError(
+                f"epochs={params['epochs']:g} over {train_rows} rows needs {params['max_steps']} steps; "
+                f"operator cap is {cap} steps (at most {most:.2f} epochs for this selection)"
+            )
     params.setdefault("max_steps", 100)
-    if params["max_steps"] > config.operator.max_steps:
-        raise RecipeError(
-            f"max_steps={params['max_steps']} exceeds operator cap {config.operator.max_steps}"
-        )
+    if params["max_steps"] > cap:
+        raise RecipeError(f"max_steps={params['max_steps']} exceeds operator cap {cap}")
     params.setdefault("lora_alpha", params.get("lora_rank", 32))
-    return {"method": method, "params": params, "overrides": sorted(overrides)}
+    recipe = {"method": method, "params": params, "overrides": sorted(overrides)}
+    if train_rows:
+        recipe["train_rows"] = train_rows
+        recipe["passes_per_example"] = passes_per_example(params["max_steps"], train_rows)
+    return recipe
 
 
 def train_sft_kwargs(config: Config, recipe: dict[str, Any]) -> dict[str, Any]:
@@ -121,7 +165,9 @@ def train_sft_kwargs(config: Config, recipe: dict[str, Any]) -> dict[str, Any]:
         "max_seq_length": config.max_seq_length,
         "max_steps": p["max_steps"],
         "learning_rate": p.get("learning_rate", 2e-4),
-        "num_train_epochs": p.get("num_train_epochs", 1),
+        "num_train_epochs": p.get("num_train_epochs", 1),  # operator config only (rehearsal variety)
+        "per_device_train_batch_size": BATCH_SIZE,
+        "gradient_accumulation_steps": GRAD_ACCUM,
         "lora_rank": p.get("lora_rank", 32),
         "lora_alpha": p["lora_alpha"],
         "warmup_steps": p.get("warmup_steps", 5),

@@ -84,7 +84,8 @@ You can use any of these, and you can switch between them whenever you like:
   note, never train). Anything you haven't decided about is left out.
 - **Keep everything.** `afterlife policy set --mode all` selects every stored
   experience except ones you have explicitly rejected, deferred or marked
-  external. Use `afterlife add --file` to store experiences without deciding.
+  external. Use `afterlife add --file` to store experiences without deciding,
+  or `afterlife import` (below) to store a whole conversation log.
 - **Write a selection policy.** `afterlife policy set --file policy.json`
   sets a JSON rule that decides about undecided experiences. Run
   `afterlife policy check --file policy.json` first to see what it would select.
@@ -111,18 +112,50 @@ mode or policy. `afterlife policy disable` returns to deciding one at a time.
 You can add `--explanation "..."` to a strategy change if you want to record
 why. It is optional.
 
+## Importing conversation logs
+
+`afterlife import --file log.jsonl` stores every exchange of a saved
+conversation as an experience you haven't decided about. It takes OpenAI-style
+chat messages (a session object, a list of sessions, or one message per line).
+Each user turn and the final assistant answer after it becomes one
+experience, with earlier exchanges from that session as context. Importing
+selects nothing: in manual mode the experiences just wait in the pool, and
+`--mode all` or a policy picks them up like any other. Re-importing the same
+log adds nothing new. Each imported experience is tagged `imported` and has
+kind `imported`.
+
+Tool calls and their results are kept as context by default and are never
+trained on themselves. `--tools drop` leaves them out instead. This changes
+what an answer is learned from:
+
+- **Kept:** the answer is learned with the fetched page in front of it. That
+  is close to how you'd use it again, but facts you could read off the page
+  carry little training signal.
+- **Dropped:** the answer is learned from the question alone. That is closer
+  to remembering it without looking.
+
+Kept tool results are cut to `--max-tool-chars` (default 2000).
+
 ## Training
 
 ```bash
 afterlife preview                      # what would be trained right now, and what is excluded and why
 afterlife methods                      # training methods, their defaults, and what you may tune
-afterlife train --request --method asft [--set learning_rate=1e-4 --set max_steps=60] [--note "..."]
+afterlife train --request --method asft [--set learning_rate=1e-4 --set epochs=3] [--note "..."]
 afterlife status                       # is it done yet?
 ```
 
 Each run trains a **fresh** adapter from the base model on the current
 selection. So whatever is selected at request time is what that adapter
 learns. Earlier runs are not stacked on top.
+
+**How much each memory is trained.** Each training step covers 8 rows, and a
+row is one target turn. With a fixed `max_steps`, a small selection is seen
+many times and a large one only a few. For example, 100 steps is about 33
+passes over 24 rows, but about 1.6 passes over 500. `preview` and
+`train --request` report `passes_per_example`. To fix the number of passes
+instead, set `--set epochs=N`, and the steps are worked out from the
+selection (within the operator's step cap).
 
 | method | what it does | notes |
 |---|---|---|

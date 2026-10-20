@@ -526,7 +526,8 @@ def _context_messages(prompt: str | None, context: Sequence[dict[str, Any]] | No
     # Afterlife: a row is either NSL2's single prompt or a full conversation
     # (system/user/assistant turns) leading up to the response.
     if context is not None:
-        return [{"role": m["role"], "content": m["content"]} for m in context]
+        keep = ("role", "content", "tool_calls", "tool_call_id", "name")
+        return [{k: m[k] for k in keep if k in m} for m in context]
     if prompt is None:
         raise ValueError("SFT row needs a prompt or context messages")
     return [{"role": "user", "content": prompt}]

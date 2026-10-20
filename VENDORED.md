@@ -28,6 +28,8 @@ Local changes are limited to:
   conversation before the response, instead of `prompt`. Both row builders
   take it as `context=` and render it with the chat template; the loader
   accepts either form. Rows with only `prompt` behave exactly as in NSL2.
+  Context messages keep `tool_calls`, `tool_call_id` and `name`, so tool use
+  renders through the template.
 
 Keep the diff against NSL2 that small: Afterlife calls `train_sft()` from
 `afterlife/worker.py`, so fixes can be ported in either direction by copying

@@ -142,7 +142,7 @@ def test_dedup_key_normalises_case_and_whitespace():
 @pytest.mark.parametrize("payload, message", [
     ({"messages": []}, "non-empty list"),
     ({"messages": [{"role": "assistant", "content": "x"}]}, "user turn"),
-    ({"messages": [{"role": "user", "content": "x"}, {"role": "tool", "content": "y"}]}, "role"),
+    ({"messages": [{"role": "user", "content": "x"}, {"role": "function", "content": "y"}]}, "role"),
     ({"messages": [{"role": "user", "content": "x", "train": True},
                    {"role": "assistant", "content": "y"}]}, "only assistant turns"),
     ({"messages": [{"role": "user", "content": "x"},

@@ -22,7 +22,7 @@ from typing import Any
 
 from afterlife.config import Config
 from afterlife.policies import current_strategy, evaluate_policy, order_experiences
-from afterlife.schemas import check_messages, find_secrets, target_turns
+from afterlife.schemas import MESSAGE_EXTRAS, check_messages, find_secrets, messages_text, target_turns
 from afterlife.store import Store
 
 EXCLUDING_DECISIONS = {"reject", "defer", "external-memory-only"}
@@ -97,7 +97,7 @@ def build_training_set(store: Store, config: Config, split_seed: str = "") -> di
         problems = check_messages(messages)
         if problems:
             excluded[eid] = "invalid: " + "; ".join(problems)
-        elif find_secrets("\n".join(m["content"] for m in messages)):
+        elif find_secrets(messages_text(messages)):
             excluded[eid] = "invalid: possible secret"
         elif e["chars"] > op.max_example_chars:
             excluded[eid] = f"too long: {e['chars']} chars > {op.max_example_chars}"
@@ -161,7 +161,7 @@ def to_trainer_rows(experience: dict[str, Any]) -> list[dict[str, Any]]:
     messages = experience["training_candidate"]["messages"]
     rows = []
     for i in target_turns(messages):
-        context = [{"role": m["role"], "content": m["content"]} for m in messages[:i]]
+        context = [{k: m[k] for k in ("role", "content", *MESSAGE_EXTRAS) if k in m} for m in messages[:i]]
         row = {"success": True, "messages": context, "raw_response": messages[i]["content"],
                "experience_id": experience["experience_id"], "turn": i}
         if len(context) == 1 and context[0]["role"] == "user":

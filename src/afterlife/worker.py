@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from afterlife.config import Config
-from afterlife.recipes import resolve_recipe, train_sft_kwargs
+from afterlife.recipes import resolve_recipe, rows_per_pass, train_sft_kwargs
 from afterlife.selection import build_training_set, to_trainer_rows
 from afterlife.store import Store, new_id, utc_now
 
@@ -88,15 +88,17 @@ def _frozen_training_set(store: Store, config: Config, request: dict[str, Any]) 
 
 def prepare_run(store: Store, config: Config, request: dict[str, Any]) -> Path:
     """Freeze the selection for a request into runs/<run-id>/. Returns the run dir."""
-    recipe = resolve_recipe(config, request["method"], request.get("params", {}))
     ts = _frozen_training_set(store, config, request) or build_training_set(store, config)
     if not ts["train"]:
         raise WorkerError("nothing to train on: the current selection is empty after validation")
+    train_rows = [r for e in ts["train"] for r in to_trainer_rows(e)]
+    recipe = resolve_recipe(config, request["method"], request.get("params", {}),
+                            train_rows=rows_per_pass(config, len(train_rows)))
 
     run_id = new_id("run")
     run_dir = store.run_dir(run_id)
     run_dir.mkdir(parents=True)
-    _write_jsonl(run_dir / "train.jsonl", [r for e in ts["train"] for r in to_trainer_rows(e)])
+    _write_jsonl(run_dir / "train.jsonl", train_rows)
     _write_jsonl(run_dir / "heldout.jsonl", [r for e in ts["heldout"] for r in to_trainer_rows(e)])
     store.write_json(
         run_dir / "selection.json",
@@ -116,7 +118,8 @@ def prepare_run(store: Store, config: Config, request: dict[str, Any]) -> Path:
         "base_model": config.base_model,
         "starts_from": "base",  # each run trains a fresh adapter from the base model
         "active_at_request": active.get("run_id"),
-        "selection": {"mode": ts["mode"], "policy_hash": ts["policy_hash"], "counts": ts["counts"]},
+        "selection": {"mode": ts["mode"], "policy_hash": ts["policy_hash"],
+                      "counts": {**ts["counts"], "train_rows": len(train_rows)}},
         "recipe": recipe,
         "train_sft_kwargs": train_sft_kwargs(config, recipe),
         "datasets": {

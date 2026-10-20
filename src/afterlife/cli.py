@@ -16,7 +16,9 @@ from typing import Any, Callable
 from afterlife import __version__
 from afterlife.config import DEFAULT_BASE_MODEL, ConfigError, render_default_config
 from afterlife.policies import PolicyError, current_strategy, set_strategy, validate_policy
-from afterlife.recipes import RecipeError, describe_methods, parse_param, resolve_recipe
+from afterlife.recipes import (
+    RecipeError, describe_methods, parse_param, resolve_recipe, rows_per_pass,
+)
 from afterlife.schemas import ValidationError, build_decision, build_experience, embedded_decision
 from afterlife.selection import build_training_set, select
 from afterlife.store import Store, find_root, new_id, utc_now
@@ -160,6 +162,17 @@ def cmd_add(args: argparse.Namespace) -> dict[str, Any]:
     return {"added": [r["experience_id"] for r in records]}
 
 
+def cmd_import(args: argparse.Namespace) -> dict[str, Any]:
+    from afterlife.importer import import_file
+
+    store = _store(args)
+    try:
+        return import_file(store, Path(args.file), session_id=args.session_id, tools=args.tools,
+                           max_tool_chars=args.max_tool_chars, tags=args.tag)
+    except (OSError, ValueError) as exc:
+        raise CliError(str(exc), EXIT_INPUT) from exc
+
+
 def cmd_nominate(args: argparse.Namespace) -> dict[str, Any]:
     store = _store(args)
     ids = list(args.id or [])
@@ -254,7 +267,16 @@ def cmd_preview(args: argparse.Namespace) -> dict[str, Any]:
     for r in ts["excluded"].values():
         key = r.split(":")[0] if not r.startswith("duplicate") else "duplicate"
         reasons[key] = reasons.get(key, 0) + 1
+    config = store.config()
+    rows = rows_per_pass(config, ts["counts"]["train_rows"])
+    passes = {}
+    for m in config.operator.allowed_methods:
+        try:
+            passes[m] = resolve_recipe(config, m, {}, train_rows=rows).get("passes_per_example")
+        except RecipeError as exc:
+            passes[m] = str(exc)
     return {"mode": ts["mode"], "policy_hash": ts["policy_hash"], "counts": ts["counts"],
+            "passes_per_example_at_default_steps": passes,
             "excluded_by_reason": reasons,
             "heldout_ids": [e["experience_id"] for e in ts["heldout"]],
             "note": "Held-out experiences are used for eval, not trained. Experiences you mark "
@@ -270,16 +292,17 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
         raise CliError("training runs on the operator's worker; use `afterlife train --request`", EXIT_INPUT)
     if not config.operator.training_enabled:
         raise CliError("training is disabled by the operator", EXIT_REFUSED)
-    try:
-        overrides = dict(parse_param(p) for p in args.set or [])
-        recipe = resolve_recipe(config, args.method, overrides)
-    except RecipeError as exc:
-        raise CliError(str(exc), EXIT_REFUSED if "operator" in str(exc) else EXIT_INPUT) from exc
     request_id = new_id("req")
     ts = build_training_set(store, config, split_seed=request_id)
     if not ts["train"]:
         raise CliError("nothing would be trained: the current selection is empty", EXIT_INPUT,
                        counts=ts["counts"])
+    try:
+        overrides = dict(parse_param(p) for p in args.set or [])
+        recipe = resolve_recipe(config, args.method, overrides,
+                                train_rows=rows_per_pass(config, ts["counts"]["train_rows"]))
+    except RecipeError as exc:
+        raise CliError(str(exc), EXIT_REFUSED if "operator" in str(exc) else EXIT_INPUT) from exc
     request = {
         "request_id": request_id, "created_at": utc_now(), "updated_at": utc_now(),
         "status": "pending", "method": args.method, "params": overrides, "note": args.note,
@@ -481,6 +504,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = add("add", cmd_add, "store experiences without deciding about them")
     sp.add_argument("--file", required=True, help="JSON/JSONL file, or - for stdin")
+
+    sp = add("import", cmd_import, "add every exchange of a saved conversation log as an undecided experience")
+    sp.add_argument("--file", required=True, help="chat log: JSON or JSONL of OpenAI-style messages or sessions")
+    sp.add_argument("--session-id", help="session id when the log doesn't carry one (default: file name)")
+    sp.add_argument("--tools", choices=("keep", "drop"), default="keep",
+                    help="keep tool calls and results as context, or drop them (default: keep)")
+    sp.add_argument("--max-tool-chars", type=int, default=2000, help="truncate kept tool results to this many characters")
+    sp.add_argument("--tag", action="append", help="extra tag for every imported experience (repeatable)")
 
     sp = add("nominate", cmd_nominate, "mark experiences as wanted for training (new via --file, or existing via --id)")
     sp.add_argument("--file", help="JSON/JSONL file, or - for stdin")

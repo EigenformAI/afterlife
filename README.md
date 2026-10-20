@@ -43,9 +43,17 @@ might look like this:
 
 ```bash
 afterlife nominate --file found-a-neat-trick.json --reason "want to remember this"
+afterlife import --file session-17.jsonl    # store a whole chat log, undecided
 afterlife policy set --mode all             # ...or keep everything instead
 afterlife train --request --method asft
 ```
+
+`afterlife import` reads OpenAI-style chat logs. Each exchange (a user turn
+and the final answer after it) becomes one experience, with earlier exchanges
+as context. Importing adds to the pool without selecting anything. If your
+agent's runtime saves sessions, an end-of-session hook running `import` saves
+the agent from writing out each experience by hand. Tool calls and results
+are kept as context (`--tools drop` removes them).
 
 ### 4. Run the worker
 
@@ -216,6 +224,10 @@ out.
   turns repeats its early context in every row, which uses context window
   and, at `max_seq_length`, can push the target turn out entirely (those rows
   are dropped with a warning).
+- `import` reads OpenAI-style chat messages only. Other log formats need
+  converting first. Kept tool turns are rendered by the model's chat template,
+  so the model needs a template that supports tools (checked for Qwen3).
+- Passes per example assume one GPU (8 rows per step).
 - Duplicate detection is exact after normalising case and whitespace.
   Near-duplicates get through.
 - Held-out loss is only informative when memories share a pattern (a style,

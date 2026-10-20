@@ -9,6 +9,7 @@ and whether it is actually trained on is decided later still, by the worker.
 
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 from typing import Any
@@ -16,7 +17,9 @@ from typing import Any
 from afterlife.store import new_id, sha256_json, utc_now
 
 SCHEMA_VERSION = "0.1"
-ROLES = {"system", "user", "assistant"}
+ROLES = {"system", "user", "assistant", "tool"}  # tool turns are context only, never trained
+# Extra message keys passed through to the chat template (tool use).
+MESSAGE_EXTRAS = ("tool_calls", "tool_call_id", "name")
 DECISIONS = ("nominate", "reject", "defer", "external-memory-only")
 VERIFICATION_STATUSES = ("unverified", "verified", "failed")
 
@@ -44,8 +47,13 @@ def find_secrets(text: str) -> list[str]:
     return [name for name, pattern in SECRET_PATTERNS.items() if pattern.search(text)]
 
 
-def _messages_text(messages: list[dict[str, Any]]) -> str:
-    return "\n".join(str(m.get("content", "")) for m in messages)
+def messages_text(messages: list[dict[str, Any]]) -> str:
+    parts = []
+    for m in messages:
+        parts.append(str(m.get("content", "")))
+        if m.get("tool_calls"):
+            parts.append(json.dumps(m["tool_calls"], ensure_ascii=False))
+    return "\n".join(parts)
 
 
 def check_messages(messages: Any) -> list[str]:
@@ -61,6 +69,8 @@ def check_messages(messages: Any) -> list[str]:
             problems.append(f"messages[{i}].role must be one of {sorted(ROLES)}")
         if not isinstance(m.get("content"), str):
             problems.append(f"messages[{i}].content must be a string")
+        if "tool_calls" in m and (m.get("role") != "assistant" or not isinstance(m["tool_calls"], list)):
+            problems.append(f"messages[{i}].tool_calls must be a list on an assistant turn")
         if "train" in m and not isinstance(m["train"], bool):
             problems.append(f"messages[{i}].train must be true or false")
         elif m.get("train") and m.get("role") != "assistant":
@@ -128,7 +138,7 @@ def build_experience(payload: dict[str, Any]) -> dict[str, Any]:
     if problems:
         raise ValidationError(problems)
 
-    secrets_found = find_secrets(_messages_text(messages))
+    secrets_found = find_secrets(messages_text(messages))
     if secrets_found:
         raise ValidationError(
             [f"looks like it contains a secret ({', '.join(secrets_found)}); remove it and retry"]
@@ -168,7 +178,7 @@ def build_experience(payload: dict[str, Any]) -> dict[str, Any]:
         "eval_only": eval_only,
         "training_candidate": {"messages": messages, "verification": verification},
         "dedup_key": dedup_key(messages),
-        "chars": len(_messages_text(messages)),
+        "chars": len(messages_text(messages)),
     }
 
 

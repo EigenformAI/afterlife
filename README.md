@@ -105,12 +105,45 @@ export GGUF or merged weights, but v0.1 doesn't wire that path up.
 
 ### About the training methods
 
-SFT is simple and fast, but in the NSL2 experiments it was very sensitive to
-learning rate and step count. ASFT (DFT plus a KL anchor to the base model)
-tolerated a much wider range of settings. DFT is in between. The agent sees
-these notes through `afterlife methods` and chooses for itself. You can
-restrict the choice with `[operator].allowed_methods` and set per-method
-defaults under `[methods.*]`.
+The three methods behave differently depending on *what* is being learned.
+So far there are two sets of results.
+
+**Refining behaviour the model already partly has** (NSL2 experiments, using
+the model's own successful outputs): DFT and ASFT were more reliable than
+SFT. SFT was very sensitive to learning rate and step count. ASFT, which is
+DFT plus a KL anchor to the base model, tolerated a much wider range of
+settings.
+
+**Learning content that's new to the model** (Afterlife GPU test, Qwen3-8B,
+three invented facts, 24 training examples; full table in
+[examples/gpu_smoke/RESULTS.md](examples/gpu_smoke/RESULTS.md)):
+
+| method | learned the new facts? | at higher learning rate × steps | leaked into unrelated answers |
+|---|---|---|---|
+| `sft` | yes at 2e-4 × 40 steps, word for word; nothing at 5e-5 × 40 | – | yes, once it learned them |
+| `dft` | no: it copied the shape of the answers with the details wrong | degraded (repetition loops, arithmetic errors) | no |
+| `asft` | no, within 150 steps at any setting tried; loss fell steadily | stable in every run | no |
+
+These results are consistent with how the methods work. DFT weights each
+token by the model's own probability of it. Tokens the model already finds
+likely get reinforced, and genuinely new tokens get almost no gradient.
+ASFT inherits that weighting and adds a pull back towards the base model, so
+it is safe but slow to take in anything new. SFT treats every token equally,
+so it learns new content, but it is easy to overshoot.
+
+Lower loss did not mean better recall. SFT at 5e-5 reached a lower held-out
+loss than any ASFT run and still recalled none of the facts. Check the probe
+answers in `afterlife eval --probes`, not just the loss.
+
+In short: for refining how you already do things, `asft` was the most robust.
+For learning something genuinely new, `sft` was the only method that got there,
+and it is worth starting with few steps and checking for leakage before
+activating. These come from small runs (one model, one seed, a few dozen
+examples), so treat them as starting points rather than rules.
+
+The agent sees a short version of these notes through `afterlife methods` and
+`SKILL.md`, and chooses for itself. You can restrict the choice with
+`[operator].allowed_methods` and set per-method defaults under `[methods.*]`.
 
 ## What you control
 

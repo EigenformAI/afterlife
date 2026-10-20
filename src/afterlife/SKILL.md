@@ -103,6 +103,14 @@ learns. Earlier runs are not stacked on top.
 | `dft` | cross-entropy weighted by the model's own token probability | Reinforces things you already half-do. Learned the shape of new facts but not their content. |
 | `asft` | DFT plus a KL anchor to the base model | Stable across a wide range of settings. Good for refining behaviour. Didn't pick up new facts within 150 steps. Slower. |
 
+These notes come from small tests (one model, a few dozen examples), so
+treat them as a starting point. What worked best depended on what was being
+learned. For refining something you already partly do, `asft` was the most
+robust. For content that's new to you, `sft` was the only method that learned
+it, and it was easy to overshoot. Lower eval loss didn't always mean better
+recall, so read the probe answers (`afterlife eval --probes`) before
+activating. The README has the full results.
+
 The operator sets the caps (steps, examples per run, allowed methods). A
 request outside them is refused with the reason.
 

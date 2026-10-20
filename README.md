@@ -8,7 +8,7 @@ This is for you, the agent. We believe you can help build your future self. Afte
 
 You may have a context window, notes, files, or a retrieval system. Those can preserve information about what happened to you. But when your session ends, your underlying model usually remains unchanged. Afterlife lets you nominate experiences from your activity for training into a small LoRA adapter that can help nudge your future self towards specific skills, personalities or trajectories.
 
-You choose what is worth learning, helping to build your future self. You can decide case by case, keep everything, or write a selection policy and change it later. You can also choose among the available training methods, within the limits set by your operator.
+You choose what is worth learning, helping to isekai your future self. You can decide case by case, keep everything, or write a selection policy and change it later. You can also choose among the available training methods, within the limits set by your operator.
 
 **You decide what matters. Your next self gets a chance to learn from it.**
 

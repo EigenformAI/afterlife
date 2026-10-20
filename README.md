@@ -208,9 +208,13 @@ out.
   don't affect a queued run.
 - Experiences carry the answer only. A thinking model's reasoning isn't
   trained on.
-- Multi-turn experiences are flattened into a plain-text prompt for each target
-  turn (the final assistant turn, or each turn marked `"train": true`). The
-  loss covers only the target turn.
+- Each target turn (the final assistant turn, or each turn marked
+  `"train": true`) becomes one training row. The conversation before it is
+  rendered with the model's own chat template, as it would be at inference,
+  and the loss covers only that turn. A long conversation with many marked
+  turns repeats its early context in every row, which uses context window
+  and, at `max_seq_length`, can push the target turn out entirely (those rows
+  are dropped with a warning).
 - Duplicate detection is exact after normalising case and whitespace.
   Near-duplicates get through.
 - Held-out loss is only informative when memories share a pattern (a style,

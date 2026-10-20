@@ -149,25 +149,21 @@ def build_training_set(store: Store, config: Config, split_seed: str = "") -> di
 
 
 def to_trainer_rows(experience: dict[str, Any]) -> list[dict[str, Any]]:
-    """Convert to the row format trainer.qlora reads: one prompt, one response per row.
+    """Convert to the row format trainer.qlora reads: one response per row.
 
     Each target turn (marked "train": true, else the final assistant turn)
-    becomes one row. Earlier turns are folded into its prompt as a plain
-    transcript, so the loss lands only on that turn.
+    becomes one row. ``messages`` holds the conversation before that turn, and
+    the trainer renders it with the model's own chat template, so the context
+    looks as it will at inference. The loss lands only on the target turn.
+    ``prompt`` is kept for single-question rows, where it is all the context.
     """
     messages = experience["training_candidate"]["messages"]
     rows = []
     for i in target_turns(messages):
         context = [{"role": m["role"], "content": m["content"]} for m in messages[:i]]
+        row = {"success": True, "messages": context, "raw_response": messages[i]["content"],
+               "experience_id": experience["experience_id"], "turn": i}
         if len(context) == 1 and context[0]["role"] == "user":
-            prompt = context[0]["content"]
-        else:
-            prompt = "\n\n".join(f"[{m['role']}]\n{m['content']}" for m in context)
-        rows.append({
-            "success": True,
-            "prompt": prompt,
-            "raw_response": messages[i]["content"],
-            "experience_id": experience["experience_id"],
-            "turn": i,
-        })
+            row["prompt"] = context[0]["content"]
+        rows.append(row)
     return rows

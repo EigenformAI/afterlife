@@ -51,7 +51,7 @@ def _completion_nll_rows(
 
     out_rows: list[tuple[float, int] | None] = []
     for row in rows[:max_rows]:
-        enc = _build_query_response_sft_row(tokenizer, prompt=row["prompt"], raw_response=row["raw_response"])
+        enc = _build_query_response_sft_row(tokenizer, raw_response=row["raw_response"], context=_context(row))
         ids = enc["input_ids"][:max_seq_length]
         labels = _build_completion_only_labels(input_ids=ids, completion_mask=enc["completion_mask"][:max_seq_length])
         n = sum(1 for l in labels[1:] if l != -100)
@@ -85,6 +85,11 @@ def _per_memory(rows: list[dict[str, Any]], scored: dict[str, list[tuple[float, 
     return out
 
 
+def _context(row: dict[str, Any]) -> list[dict[str, str]]:
+    """The conversation before a row's response (older rows carry only a prompt)."""
+    return row.get("messages") or [{"role": "user", "content": row["prompt"]}]
+
+
 def split_thinking(text: str) -> dict[str, str | None]:
     """Separate a thinking model's reasoning from its answer.
 
@@ -99,7 +104,7 @@ def split_thinking(text: str) -> dict[str, str | None]:
     return {"thinking": None, "answer": text.strip()}
 
 
-def _generate(model: Any, tokenizer: Any, prompts: list[str], max_new_tokens: int) -> list[str]:
+def _generate(model: Any, tokenizer: Any, conversations: list[list[dict[str, str]]], max_new_tokens: int) -> list[str]:
     import torch
 
     text_tok = getattr(tokenizer, "tokenizer", tokenizer)
@@ -108,12 +113,10 @@ def _generate(model: Any, tokenizer: Any, prompts: list[str], max_new_tokens: in
         text_tok.pad_token = text_tok.eos_token
     device = next(model.parameters()).device
     outputs: list[str] = []
-    for i in range(0, len(prompts), PROBE_BATCH_SIZE):
+    for i in range(0, len(conversations), PROBE_BATCH_SIZE):
         batch = [
-            tokenizer.apply_chat_template(
-                [{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True
-            )
-            for p in prompts[i : i + PROBE_BATCH_SIZE]
+            tokenizer.apply_chat_template(c, tokenize=False, add_generation_prompt=True)
+            for c in conversations[i : i + PROBE_BATCH_SIZE]
         ]
         inputs = text_tok(batch, return_tensors="pt", padding=True, add_special_tokens=False).to(device)
         with torch.no_grad():
@@ -182,8 +185,9 @@ def evaluate_run(run_dir: Path) -> dict[str, Any]:
                 "heldout": _mean(_completion_nll_rows(model, tokenizer, heldout_rows, max_seq, n_loss)),
                 "train": _mean(train_scored[name]),
             }
-            texts = _generate(model, tokenizer, [p["prompt"] for p in probes] + [r["prompt"] for r in recall_rows],
-                              eval_cfg.probe_max_new_tokens)
+            conversations = [[{"role": "user", "content": p["prompt"]}] for p in probes]
+            conversations += [_context(r) for r in recall_rows]
+            texts = _generate(model, tokenizer, conversations, eval_cfg.probe_max_new_tokens)
             for i, (p, text) in enumerate(zip(probes, texts)):
                 answers[p.get("id", str(i))][name] = split_thinking(text)
             for slot, text in zip(recall_answers, texts[len(probes):]):
@@ -223,7 +227,7 @@ def evaluate_run(run_dir: Path) -> dict[str, Any]:
         "summary": summary,
         "memories": memories,
         "recall": [
-            {"experience_id": r.get("experience_id"), "turn": r.get("turn"), "prompt": r["prompt"],
+            {"experience_id": r.get("experience_id"), "turn": r.get("turn"), "context": _context(r),
              "target": r["raw_response"], "answers": a}
             for r, a in zip(recall_rows, recall_answers)
         ],

@@ -141,7 +141,7 @@ def test_worker_dry_run_freezes_selection(home, cli, write_json):
     run_dir = home / "runs" / manifest["run_id"]
     rows = [json.loads(l) for l in (run_dir / "train.jsonl").read_text().splitlines()]
     rows += [json.loads(l) for l in (run_dir / "heldout.jsonl").read_text().splitlines()]
-    assert all(r["success"] and r["prompt"] and r["raw_response"] for r in rows)
+    assert all(r["success"] and r["messages"] and r["raw_response"] for r in rows)
     selection = json.loads((run_dir / "selection.json").read_text())
     assert selection["excluded"][dup].startswith("duplicate of")
 

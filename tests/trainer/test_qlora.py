@@ -289,6 +289,70 @@ class TestLoadSftDataset(unittest.TestCase):
         trained = "".join(chr(i) for i, m in zip(row["input_ids"], row["completion_mask"]) if m)
         self.assertEqual(trained, "Answer<im_end>")
 
+    def test_build_query_response_sft_row_renders_multi_turn_context(self):
+        # Afterlife: earlier turns are rendered by the chat template as real turns
+        # (not folded into one user message) and carry no loss; only the final
+        # response + end-of-turn marker does, even if its text appeared earlier.
+        from afterlife.trainer.qlora import _build_query_response_sft_row
+
+        class QwenLikeTokenizer:
+            pad_token_id = 0
+            eos_token_id = 2
+
+            def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+                text = ""
+                for i, m in enumerate(messages):
+                    think = "<think>\n\n</think>\n\n" if m["role"] == "assistant" and i == len(messages) - 1 else ""
+                    text += f"<im_start>{m['role']}\n{think}{m['content']}<im_end>\n"
+                return text
+
+            def __call__(self, text=None, **_kwargs):
+                return {"input_ids": [ord(c) for c in text], "attention_mask": [1] * len(text)}
+
+            def decode(self, ids):
+                return "".join(chr(i) for i in ids)
+
+        context = [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "Q1"},
+            {"role": "assistant", "content": "Same"},
+            {"role": "user", "content": "Q2"},
+        ]
+        row = _build_query_response_sft_row(QwenLikeTokenizer(), raw_response="Same", context=context)
+        text = "".join(chr(i) for i in row["input_ids"])
+        self.assertIn("<im_start>system\nbe brief<im_end>", text)
+        self.assertIn("<im_start>assistant\nSame<im_end>\n<im_start>user\nQ2", text)
+        trained = "".join(chr(i) for i, m in zip(row["input_ids"], row["completion_mask"]) if m)
+        self.assertEqual(trained, "Same<im_end>")
+
+    def test_loader_reads_message_rows_and_prompt_rows(self):
+        from afterlife.trainer.qlora import _load_self_generated_sft_rows
+
+        class Tok:
+            def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+                return "".join(f"<{m['role']}>{m['content']}</{m['role']}>" for m in messages)
+
+            def __call__(self, text=None, **_kwargs):
+                return {"input_ids": [ord(c) for c in text], "attention_mask": [1] * len(text)}
+
+            def decode(self, ids):
+                return "".join(chr(i) for i in ids)
+
+        rows = [
+            {"success": True, "prompt": "Q", "raw_response": "A"},
+            {"success": True, "messages": [{"role": "user", "content": "Q1"},
+                                           {"role": "assistant", "content": "A1"},
+                                           {"role": "user", "content": "Q2"}], "raw_response": "A2"},
+            {"success": True, "messages": [{"role": "user"}], "raw_response": "bad"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "train.jsonl"
+            path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+            loaded = _load_self_generated_sft_rows([path], Tok())
+        self.assertEqual(len(loaded), 2)
+        texts = ["".join(chr(i) for i in r["input_ids"]) for r in loaded]
+        self.assertEqual(texts[1], "<user>Q1</user><assistant>A1</assistant><user>Q2</user><assistant>A2</assistant>")
+
     def test_build_query_response_sft_row_handles_thinking_channel_scaffold(self):
         # Regression: Gemma 4's chat template appends a thought-channel scaffold when
         # add_generation_prompt=True that is absent from the assistant-message

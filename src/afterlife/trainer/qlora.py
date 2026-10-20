@@ -522,13 +522,26 @@ def _tokenize_text(tokenizer: Any, text: str) -> list[int]:
     return _encode_text(tokenizer, text)["input_ids"]
 
 
+def _context_messages(prompt: str | None, context: Sequence[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    # Afterlife: a row is either NSL2's single prompt or a full conversation
+    # (system/user/assistant turns) leading up to the response.
+    if context is not None:
+        return [{"role": m["role"], "content": m["content"]} for m in context]
+    if prompt is None:
+        raise ValueError("SFT row needs a prompt or context messages")
+    return [{"role": "user", "content": prompt}]
+
+
 def _build_query_response_sft_row(
     tokenizer: Any,
     *,
-    prompt: str,
+    prompt: str | None = None,
     raw_response: str,
+    context: Sequence[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    # Afterlife: put the loss on the response content and the end-of-turn marker
+    # Afterlife: render the conversation with the model's own chat template, so
+    # multi-turn context looks exactly as it will at inference. Put the loss on
+    # the response content and the end-of-turn marker
     # only. Everything the template renders before the response (the assistant
     # turn marker, an empty Qwen3 <think></think> block, Gemma's model-turn
     # scaffold) is treated as prompt, and whitespace after the end-of-turn token
@@ -536,11 +549,9 @@ def _build_query_response_sft_row(
     # thinking models from learning "skip thinking" from answer-only examples.
     # Falls back to the NSL2 boundary below when the response text cannot be
     # located on a token boundary in the rendered conversation.
+    messages = _context_messages(prompt, context)
     full_text = tokenizer.apply_chat_template(
-        [
-            {"role": "user", "content": prompt},
-            {"role": "assistant", "content": raw_response},
-        ],
+        messages + [{"role": "assistant", "content": raw_response}],
         tokenize=False,
         add_generation_prompt=False,
     )
@@ -563,15 +574,16 @@ def _build_query_response_sft_row(
             row["length"] = len(input_ids)
             return row
     return _build_query_response_sft_row_nsl(
-        tokenizer, prompt=prompt, raw_response=raw_response
+        tokenizer, prompt=prompt, raw_response=raw_response, context=context
     )
 
 
 def _build_query_response_sft_row_nsl(
     tokenizer: Any,
     *,
-    prompt: str,
+    prompt: str | None = None,
     raw_response: str,
+    context: Sequence[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     # Render the masked-prompt boundary WITHOUT the generation prompt. Gemma 4's
     # chat template, with add_generation_prompt=True, appends a "thinking channel"
@@ -583,16 +595,14 @@ def _build_query_response_sft_row_nsl(
     # assistant-style rendering (add_generation_prompt=False) is the user turn only,
     # which IS a clean prefix of the user+assistant conversation; the completion
     # then covers the model turn marker plus the response.
+    messages = _context_messages(prompt, context)
     prompt_text = tokenizer.apply_chat_template(
-        [{"role": "user", "content": prompt}],
+        messages,
         tokenize=False,
         add_generation_prompt=False,
     )
     full_text = tokenizer.apply_chat_template(
-        [
-            {"role": "user", "content": prompt},
-            {"role": "assistant", "content": raw_response},
-        ],
+        messages + [{"role": "assistant", "content": raw_response}],
         tokenize=False,
         add_generation_prompt=False,
     )
@@ -758,6 +768,17 @@ def _make_completion_only_data_collator(
     )
 
 
+def _is_message_list(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(
+            isinstance(m, dict) and isinstance(m.get("role"), str) and isinstance(m.get("content"), str)
+            for m in value
+        )
+    )
+
+
 def _load_self_generated_sft_rows(
     training_data_paths: Sequence[Path],
     tokenizer: Any,
@@ -780,7 +801,14 @@ def _load_self_generated_sft_rows(
 
                 prompt = payload.get("prompt")
                 raw_response = payload.get("raw_response")
-                if not isinstance(prompt, str) or not isinstance(raw_response, str):
+                context = payload.get("messages")  # Afterlife: conversation before the response
+                if not isinstance(raw_response, str):
+                    continue
+                if context is not None:
+                    if not _is_message_list(context):
+                        continue
+                    prompt = None
+                elif not isinstance(prompt, str):
                     continue
 
                 # Keep one full-conversation encoding to avoid the Gemma 4
@@ -790,6 +818,7 @@ def _load_self_generated_sft_rows(
                     tokenizer,
                     prompt=prompt,
                     raw_response=raw_response,
+                    context=context,
                 )
                 # Drop rows whose prompt alone fills the sequence window: after the
                 # collator truncates to the first max_seq_length tokens, no response

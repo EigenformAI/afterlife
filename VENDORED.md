@@ -24,6 +24,10 @@ Local changes are limited to:
   behaviour is kept as `_build_query_response_sft_row_nsl` and used as the
   fallback when the response text can't be found on a token boundary. NSL2 is
   probably affected too (at least the turn marker and trailing newline).
+- Multi-turn rows (`qlora.py`): a training row may carry `messages`, the
+  conversation before the response, instead of `prompt`. Both row builders
+  take it as `context=` and render it with the chat template; the loader
+  accepts either form. Rows with only `prompt` behave exactly as in NSL2.
 
 Keep the diff against NSL2 that small: Afterlife calls `train_sft()` from
 `afterlife/worker.py`, so fixes can be ported in either direction by copying

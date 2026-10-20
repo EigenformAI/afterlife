@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from conftest import experience
 
@@ -80,17 +82,24 @@ def test_require_verified(home, cli, write_json):
     assert ts["counts"]["validated"] == 1
 
 
-def test_multi_turn_folds_context_into_prompt():
-    exp = build_experience({"messages": [
+def test_multi_turn_keeps_the_conversation_as_messages():
+    messages = [
         {"role": "system", "content": "be brief"},
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "hello"},
         {"role": "user", "content": "and?"},
         {"role": "assistant", "content": "that's all"},
-    ]})
-    [row] = to_trainer_rows(exp)
+    ]
+    [row] = to_trainer_rows(build_experience({"messages": messages}))
     assert row["raw_response"] == "that's all"
-    assert "[system]\nbe brief" in row["prompt"] and "[assistant]\nhello" in row["prompt"]
+    assert row["messages"] == messages[:-1]
+    assert "prompt" not in row  # the trainer renders messages with the chat template
+
+
+def test_single_question_row_also_carries_prompt():
+    [row] = to_trainer_rows(build_experience(experience("a")))
+    assert row["prompt"] == "prompt for a"
+    assert row["messages"] == [{"role": "user", "content": "prompt for a"}]
 
 
 def test_marked_turns_are_learned_instead_of_the_last():
@@ -104,9 +113,10 @@ def test_marked_turns_are_learned_instead_of_the_last():
     ]})
     rows = to_trainer_rows(exp)
     assert [r["raw_response"] for r in rows] == ["use the Wayback Machine", "look for a link rel=alternate tag"]
-    assert rows[0]["prompt"] == "how do I find old pages?"
-    assert "[assistant]\nuse the Wayback Machine" in rows[1]["prompt"]
-    assert all("welcome" not in r["prompt"] + r["raw_response"] for r in rows)
+    assert rows[0]["messages"] == [{"role": "user", "content": "how do I find old pages?"}]
+    assert [m["role"] for m in rows[1]["messages"]] == ["user", "assistant", "user"]
+    assert all("train" not in m for r in rows for m in r["messages"])
+    assert all("welcome" not in json.dumps(r) for r in rows)
 
 
 def test_marked_conversation_may_end_on_a_user_turn():

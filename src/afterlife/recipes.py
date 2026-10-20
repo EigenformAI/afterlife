@@ -126,7 +126,7 @@ def train_sft_kwargs(config: Config, recipe: dict[str, Any]) -> dict[str, Any]:
     }
     if recipe["method"] == "asft":
         kwargs["asft_mode"] = "asft"
-        kwargs["asft_kl_weight"] = p.get("asft_kl_weight", 0.05)
+        kwargs["asft_kl_weight"] = p.get("asft_kl_weight", 0.1)
     if config.operator.rehearsal_dataset and config.operator.rehearsal_rows_per_epoch > 0:
         kwargs["rehearsal_dataset"] = config.operator.rehearsal_dataset
         kwargs["rehearsal_rows_per_epoch"] = config.operator.rehearsal_rows_per_epoch

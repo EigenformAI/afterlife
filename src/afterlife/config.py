@@ -60,7 +60,7 @@ lora_rank = 32
 learning_rate = 2e-4
 max_steps = 100
 lora_rank = 32
-asft_kl_weight = 0.05
+asft_kl_weight = 0.1
 """
 
 

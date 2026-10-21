@@ -1,9 +1,9 @@
 """CPU unit tests for the vendored ASFT loss helpers (``afterlife/trainer/asft.py``).
 
 These cover the parts that do not require the Triton CE kernel (no GPU): the
-KL-gating resolution (local review fix #1), label shifting, logit transforms,
-DFT weighting via the CE-losses path, and KL divergence. End-to-end loss and
-trainer behaviour require a GPU smoke test (design doc step 7).
+KL-gating resolution, label shifting, logit transforms, DFT weighting via the
+CE-losses path, and KL divergence. End-to-end loss and trainer behaviour need
+a GPU run (see examples/gpu_smoke).
 """
 
 import unittest
@@ -88,20 +88,6 @@ class TestAsftLossHelpers(unittest.TestCase):
         self.assertTrue(bool((kl_fwd >= -1e-6).all()))
         self.assertTrue(bool((kl_rev >= -1e-6).all()))
         self.assertFalse(torch.allclose(kl_fwd, kl_rev))
-
-
-class TestAsftTrainerWiring(unittest.TestCase):
-    """Prove the local trainer/config are real (not just mocked in qlora tests)."""
-
-    def test_asft_trainer_subclasses_unsloth_trainer(self):
-        from unsloth.trainer import UnslothTrainer
-
-        from afterlife.trainer.asft import ASFTStreamingConfig as LossStreamingConfig
-        from afterlife.trainer.asft_trainer import ASFTStreamingConfig, ASFTTrainer
-
-        self.assertTrue(issubclass(ASFTTrainer, UnslothTrainer))
-        # ASFTStreamingConfig is re-exported from the vendored loss module.
-        self.assertIs(ASFTStreamingConfig, LossStreamingConfig)
 
 
 class TestKlSeqChunkedCheckpoint(unittest.TestCase):

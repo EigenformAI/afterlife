@@ -34,11 +34,36 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+
+
 def load_probes(store_root: Path) -> list[dict[str, Any]]:
+    """Shipped regression probes, then the agent's. Every probe gets a unique id.
+
+    An agent probe reusing an id (a shipped one, or its own) gets a source
+    prefix and a counter, so its answers can never land under another prompt.
+    """
     shipped = resources.files("afterlife").joinpath("data/probes.jsonl").read_text(encoding="utf-8")
-    probes = [dict(json.loads(l), source="regression") for l in shipped.splitlines() if l.strip()]
-    probes += [dict(p, source="agent") for p in _read_jsonl(store_root / "probes.jsonl")]
-    return [p for p in probes if isinstance(p.get("prompt"), str)]
+    raw = [(json.loads(l), "regression") for l in shipped.splitlines() if l.strip()]
+    raw += [(p, "agent") for p in _read_jsonl(store_root / "probes.jsonl")]
+    probes: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for p, source in raw:
+        if not isinstance(p, dict) or not isinstance(p.get("prompt"), str):
+            continue
+        pid = str(p.get("id") or f"{source}-{len(probes)}")
+        if pid in seen:
+            n, base = 2, f"{source}:{pid}"
+            pid = base
+            while pid in seen:
+                pid, n = f"{base}-{n}", n + 1
+        seen.add(pid)
+        probes.append(dict(p, id=pid, source=source))
+    return probes
 
 
 def _completion_nll_rows(
@@ -144,9 +169,15 @@ def evaluate_run(run_dir: Path) -> dict[str, Any]:
     max_seq = manifest["train_sft_kwargs"]["max_seq_length"]
 
     variants: dict[str, Path | None] = {"base": None}
-    prev = manifest.get("active_at_request")
+    skipped: dict[str, str] = {}
+    prev = manifest.get("active_at_run", manifest.get("active_at_request"))  # older manifests
     if prev and (store_root / "runs" / prev / "adapter").is_dir():
-        variants["current"] = store_root / "runs" / prev / "adapter"
+        prev_manifest = _read_json(store_root / "runs" / prev / "manifest.json")
+        if prev_manifest.get("base_model", manifest["base_model"]) != manifest["base_model"]:
+            # Its weights belong to another base; loading them here would compare nonsense.
+            skipped["current"] = f"{prev} was trained on {prev_manifest['base_model']}"
+        else:
+            variants["current"] = store_root / "runs" / prev / "adapter"
     variants["updated"] = run_dir / "adapter"
 
     model, tokenizer = _load_base_model(manifest["base_model"], max_seq_length=max_seq)
@@ -175,7 +206,7 @@ def evaluate_run(run_dir: Path) -> dict[str, Any]:
 
     losses: dict[str, dict[str, float | None]] = {}
     train_scored: dict[str, list[tuple[float, int] | None]] = {}
-    answers: dict[str, dict[str, Any]] = {p.get("id", str(i)): {} for i, p in enumerate(probes)}
+    answers: list[dict[str, Any]] = [{} for _ in probes]
     recall_answers: list[dict[str, Any]] = [{} for _ in recall_rows]
     n_loss = eval_cfg.max_loss_rows
     for name in variants:
@@ -188,8 +219,8 @@ def evaluate_run(run_dir: Path) -> dict[str, Any]:
             conversations = [[{"role": "user", "content": p["prompt"]}] for p in probes]
             conversations += [_context(r) for r in recall_rows]
             texts = _generate(model, tokenizer, conversations, eval_cfg.probe_max_new_tokens)
-            for i, (p, text) in enumerate(zip(probes, texts)):
-                answers[p.get("id", str(i))][name] = split_thinking(text)
+            for slot, text in zip(answers, texts):
+                slot[name] = split_thinking(text)
             for slot, text in zip(recall_answers, texts[len(probes):]):
                 slot[name] = split_thinking(text)
 
@@ -213,7 +244,7 @@ def evaluate_run(run_dir: Path) -> dict[str, Any]:
         "heldout_rows": len(heldout_rows),
         "probes": len(probes),
         "probes_unfinished": {
-            name: sum(1 for a in answers.values() if a.get(name, {}).get("answer") == "")
+            name: sum(1 for a in answers if a.get(name, {}).get("answer") == "")
             for name in variants
         },
         "probe_max_new_tokens": eval_cfg.probe_max_new_tokens,
@@ -224,6 +255,10 @@ def evaluate_run(run_dir: Path) -> dict[str, Any]:
     report = {
         "run_id": manifest["run_id"],
         "variants": {k: (str(v) if v else None) for k, v in variants.items()},
+        "variants_skipped": skipped,
+        # Read from config.toml when the eval ran, not when the run was requested.
+        "eval_settings": {"probe_max_new_tokens": eval_cfg.probe_max_new_tokens,
+                          "max_loss_rows": eval_cfg.max_loss_rows, "recall_rows": eval_cfg.recall_rows},
         "summary": summary,
         "memories": memories,
         "recall": [
@@ -232,9 +267,8 @@ def evaluate_run(run_dir: Path) -> dict[str, Any]:
             for r, a in zip(recall_rows, recall_answers)
         ],
         "probes": [
-            {"id": p.get("id", str(i)), "source": p["source"], "prompt": p["prompt"],
-             "answers": answers[p.get("id", str(i))]}
-            for i, p in enumerate(probes)
+            {"id": p["id"], "source": p["source"], "prompt": p["prompt"], "answers": a}
+            for p, a in zip(probes, answers)
         ],
     }
     (run_dir / "eval.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")

@@ -68,6 +68,11 @@ _DEFAULT_REF_MICROBATCH_DIVISOR = 2  # batch_size // this value
 class ASFTStreamingConfig:
     """Configuration for ASFT streaming strategies to reduce VRAM peak.
 
+    Afterlife: only ``seq_chunk_size`` and ``force_fp32_kl`` affect the active
+    loss path. The reference forward always runs in full; ``mode``,
+    ``enabled``, ``ref_strategy`` and ``ref_microbatch_size`` are accepted for
+    NSL2 compatibility but have no effect (train_sft warns when they are set).
+
     Attributes:
         mode: High-level streaming mode.
             - "off": Disable streaming.

@@ -162,7 +162,7 @@ def import_file(
     config = store.config()
     sessions = load_sessions(path, session_id or path.stem)
     known = store.experience_ids()
-    added, refused = [], []
+    records, refused = [], []
     totals = {"sessions": len(sessions), "already_imported": 0, "messages_dropped": 0, "exchanges_without_answer": 0}
     for session in sessions:
         payloads, stats = session_experiences(
@@ -181,7 +181,13 @@ def import_file(
             except ValidationError as exc:
                 refused.append({"trajectory_ref": payload["trajectory_ref"], "problems": exc.problems})
                 continue
-            store.append(store.experiences_path, record)
             known.add(record["experience_id"])
-            added.append(record["experience_id"])
-    return {"added": added, "refused": refused, **totals}
+            records.append(record)
+
+    def not_yet_stored() -> list[dict[str, Any]]:  # a concurrent import of the same log may have won
+        stored = store.experience_ids()
+        totals["already_imported"] += sum(1 for r in records if r["experience_id"] in stored)
+        return [r for r in records if r["experience_id"] not in stored]
+
+    added = store.append_many(store.experiences_path, not_yet_stored)
+    return {"added": [r["experience_id"] for r in added], "refused": refused, **totals}

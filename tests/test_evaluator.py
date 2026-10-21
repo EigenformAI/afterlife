@@ -1,4 +1,6 @@
-from afterlife.evaluator import _mean, _per_memory
+import json
+
+from afterlife.evaluator import _mean, _per_memory, load_probes
 
 
 def test_per_memory_pools_turns_of_one_experience():
@@ -17,3 +19,17 @@ def test_per_memory_ignores_rows_past_the_scored_limit():
 
 def test_mean_of_nothing_is_none():
     assert _mean([None]) is None and _mean([]) is None
+
+
+def test_agent_probes_cannot_take_a_shipped_probe_id(tmp_path):
+    custom = [{"id": "reg-arith", "prompt": "custom one"}, {"id": "reg-arith", "prompt": "custom two"},
+              {"prompt": "no id"}, {"id": "bad", "prompt": ["not", "a", "string"]}, "not an object"]
+    (tmp_path / "probes.jsonl").write_text("\n".join(json.dumps(p) for p in custom))
+    probes = load_probes(tmp_path)
+    ids = [p["id"] for p in probes]
+    assert len(ids) == len(set(ids))
+    by_id = {p["id"]: p for p in probes}
+    assert by_id["reg-arith"]["source"] == "regression" and "17 * 23" in by_id["reg-arith"]["prompt"]
+    assert by_id["agent:reg-arith"]["prompt"] == "custom one"
+    assert by_id["agent:reg-arith-2"]["prompt"] == "custom two"
+    assert sum(p["source"] == "agent" for p in probes) == 3  # malformed ones dropped

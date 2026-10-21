@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 import time
 from importlib import resources
@@ -19,8 +20,8 @@ from afterlife.policies import PolicyError, current_strategy, set_strategy, vali
 from afterlife.recipes import (
     RecipeError, describe_methods, parse_param, resolve_recipe, rows_per_pass,
 )
-from afterlife.schemas import ValidationError, build_decision, build_experience, embedded_decision
-from afterlife.selection import build_training_set, select
+from afterlife.schemas import ValidationError, build_decision, build_experience, embedded_decision, find_secrets
+from afterlife.selection import build_training_set, content_hash, select
 from afterlife.store import Store, find_root, new_id, utc_now
 
 EXIT_OK, EXIT_ERROR, EXIT_INPUT, EXIT_REFUSED, EXIT_NOT_FOUND = 0, 1, 2, 3, 4
@@ -74,8 +75,14 @@ def _ingest(store: Store, path: str) -> list[dict[str, Any]]:
             raise CliError(f"experience id {record['experience_id']} already exists", EXIT_INPUT)
         known.add(record["experience_id"])
         records.append(record)
-    for record in records:
-        store.append(store.experiences_path, record)
+
+    def no_clash() -> list[dict[str, Any]]:  # re-checked under the store lock: another process may have written since
+        clash = sorted({r["experience_id"] for r in records} & store.experience_ids())
+        if clash:
+            raise CliError(f"experience id {clash[0]} already exists", EXIT_INPUT)
+        return records
+
+    store.append_many(store.experiences_path, no_clash)
     for record, decision in zip(records, decisions):
         if decision:
             _decide(store, [record["experience_id"]], decision[0], decision[1])
@@ -88,14 +95,14 @@ def _decide(store: Store, ids: list[str], decision: str, reason: str | None) -> 
     if missing:
         raise CliError(f"unknown experience id(s): {', '.join(missing)}", EXIT_NOT_FOUND)
     strategy = current_strategy(store)
-    out = []
-    for eid in ids:
-        d = build_decision(
-            eid, decision, reason=reason, mode=strategy["mode"],
-            policy_hash=strategy["policy_hash"], active_run=store.active().get("run_id"),
-        )
+    try:
+        out = [build_decision(eid, decision, reason=reason, mode=strategy["mode"],
+                              policy_hash=strategy["policy_hash"], active_run=store.active().get("run_id"))
+               for eid in ids]
+    except ValidationError as exc:
+        raise CliError(str(exc), EXIT_INPUT, problems=exc.problems) from exc
+    for d in out:
         store.append(store.decisions_path, d)
-        out.append(d)
     return out
 
 
@@ -176,6 +183,8 @@ def cmd_import(args: argparse.Namespace) -> dict[str, Any]:
 def cmd_nominate(args: argparse.Namespace) -> dict[str, Any]:
     store = _store(args)
     ids = list(args.id or [])
+    if args.reason and find_secrets(args.reason):  # before --file stores anything
+        raise CliError("reason looks like it contains a secret; remove it and retry", EXIT_INPUT)
     if args.file:
         ids += [r["experience_id"] for r in _ingest(store, args.file)]
     if not ids:
@@ -278,6 +287,7 @@ def cmd_preview(args: argparse.Namespace) -> dict[str, Any]:
     return {"mode": ts["mode"], "policy_hash": ts["policy_hash"], "counts": ts["counts"],
             "passes_per_example_at_default_steps": passes,
             "excluded_by_reason": reasons,
+            "excluded": ts["excluded"],
             "heldout_ids": [e["experience_id"] for e in ts["heldout"]],
             "note": "Held-out experiences are used for eval, not trained. Experiences you mark "
                     "eval_only are always held out; nominated ones never are. Others picked by "
@@ -313,12 +323,42 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
             "train_ids": [e["experience_id"] for e in ts["train"]],
             "heldout_ids": [e["experience_id"] for e in ts["heldout"]],
             "excluded": ts["excluded"],
+            "content_hashes": {e["experience_id"]: content_hash(e) for e in ts["train"] + ts["heldout"]},
         },
+        "active_at_request": store.active().get("run_id"),
         "created_ns": time.time_ns(),
     }
     store.save_request(request)
-    return {"request": request, "recipe": recipe,
-            "message": "queued; the operator's worker will pick it up"}
+    result = {"request": request, "recipe": recipe, "message": "queued; the operator's worker will pick it up",
+              "note": "What is trained and your --set overrides are fixed now. Defaults, operator limits, "
+                      "models, probes and eval settings are read when the worker runs it, so `recipe` "
+                      "shows them as of now; the run's manifest and eval record what was used."}
+    over = [i for i, r in ts["excluded"].items() if r.startswith("over budget")]
+    if over:
+        result["over_budget"] = len(over)
+        result["warning"] = (f"{len(over)} selected experience(s) don't fit the operator's budget of "
+                             f"{config.operator.max_examples_per_run} per run and won't be trained this run. "
+                             "Nominations go first, then policy picks in the policy's order; "
+                             "`afterlife preview` lists which were left out.")
+    return result
+
+
+def cmd_retry(args: argparse.Namespace) -> dict[str, Any]:
+    """Queue a failed or interrupted request again, with the selection it froze."""
+    store = _store(args)
+    if not store.config().operator.training_enabled:
+        raise CliError("training is disabled by the operator", EXIT_REFUSED)
+    request = next((r for r in store.requests() if r["request_id"] == args.request_id), None)
+    if request is None:
+        raise CliError(f"no request {args.request_id!r}", EXIT_NOT_FOUND)
+    if request["status"] not in ("failed", "interrupted"):
+        raise CliError(f"request {args.request_id} is {request['status']}; only failed or interrupted "
+                       "requests can be retried", EXIT_INPUT)
+    attempts = request.get("previous_attempts", []) + [
+        {k: request.get(k) for k in ("status", "run_id", "error", "updated_at")}]
+    request.update(status="pending", run_id=None, error=None, updated_at=utc_now(), previous_attempts=attempts)
+    store.save_request(request)
+    return {"request": request, "message": "queued again; the operator's worker will pick it up"}
 
 
 def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
@@ -333,6 +373,7 @@ def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
         "strategy": {k: v for k, v in current_strategy(store).items() if k != "policy"},
         "experiences": counts,
         "requests": [{k: r.get(k) for k in ("request_id", "status", "method", "run_id", "error")}
+                     | {k: r[k] for k in ("blocked_reason", "eligible_at") if r.get(k)}
                      for r in store.requests()[-5:]],
         "runs": [{k: r.get(k) for k in ("run_id", "status", "created_at", "error")} | {
                      "method": r["recipe"]["method"], "train": r["selection"]["counts"]["train"]}
@@ -373,7 +414,44 @@ def _activation_stack(history: list[dict[str, Any]]) -> list[str | None]:
     return stack
 
 
+ADAPTER_WEIGHTS = ("adapter_model.safetensors", "adapter_model.bin")
+
+
+def _check_target(store: Store, manifest: dict[str, Any]) -> str:
+    """The one check every switch to an adapter passes: activate and every kind of rollback.
+
+    Returns the run id, or raises if the run is not ready, its adapter files are
+    missing, or it was trained for a different model than the config now names.
+    """
+    run_id = manifest["run_id"]
+    if manifest.get("status") != "ready":
+        raise CliError(f"run {run_id} is {manifest.get('status')}, not ready", EXIT_INPUT)
+    adapter = store.run_dir(run_id) / "adapter"
+    if not (adapter / "adapter_config.json").is_file() or not any((adapter / w).is_file() for w in ADAPTER_WEIGHTS):
+        raise CliError(f"run {run_id} has no complete adapter at {adapter}", EXIT_INPUT)
+    mismatch = _model_mismatch(store.config(), manifest)
+    if mismatch:
+        raise CliError(f"run {run_id} {mismatch}; change [model] back or train a new adapter", EXIT_REFUSED)
+    return run_id
+
+
+def _model_mismatch(config: Any, manifest: dict[str, Any]) -> str | None:
+    """Why an adapter doesn't fit the configured models, or None.
+
+    Training and serving names legitimately differ (a 4-bit checkpoint trains,
+    its full-precision original serves), so each is compared with what the run
+    recorded for that role, not with each other. Runs from before serve_model
+    was recorded are checked on the training base only.
+    """
+    if manifest.get("base_model") and manifest["base_model"] != config.base_model:
+        return f"was trained on {manifest['base_model']}, but the config now trains {config.base_model}"
+    if manifest.get("serve_model") and manifest["serve_model"] != config.serve_model:
+        return f"was trained to serve on {manifest['serve_model']}, but the config now serves {config.serve_model}"
+    return None
+
+
 def _set_active(store: Store, run_id: str | None, actor: str, action: str, to: str | None = None) -> dict[str, Any]:
+    """Record the switch, then publish it. Call with the store lock held."""
     active = store.active()
     adapter_path = str(store.run_dir(run_id) / "adapter") if run_id else None
     entry = {"run_id": run_id, "at": utc_now(), "by": actor, "action": action}
@@ -382,12 +460,8 @@ def _set_active(store: Store, run_id: str | None, actor: str, action: str, to: s
     new = {"run_id": run_id, "adapter_path": adapter_path, "activated_at": entry["at"],
            "history": active.get("history", []) + [entry]}
     store.write_json(store.active_path, new)
-    link = store.root / "active-adapter"
-    if link.is_symlink() or link.exists():
-        link.unlink()
-    if adapter_path:
-        link.symlink_to(Path("runs") / run_id / "adapter")
-    return {k: v for k, v in new.items() if k != "history"} | {"stable_path": str(link)}
+    store.sync_active_link()  # a crash before this is repaired by the next sync
+    return {k: v for k, v in new.items() if k != "history"} | {"stable_path": str(store.active_link)}
 
 
 def _check_may_activate(store: Store, args: argparse.Namespace) -> str:
@@ -398,51 +472,84 @@ def _check_may_activate(store: Store, args: argparse.Namespace) -> str:
     return "agent"
 
 
+def _resolve(store: Store, ref: str) -> dict[str, Any]:
+    try:
+        return store.resolve_run(ref)
+    except LookupError as exc:
+        raise CliError(str(exc), EXIT_NOT_FOUND) from exc
+
+
 def cmd_activate(args: argparse.Namespace) -> dict[str, Any]:
     store = _store(args)
     actor = _check_may_activate(store, args)
-    try:
-        manifest = store.resolve_run(args.run)
-    except LookupError as exc:
-        raise CliError(str(exc), EXIT_NOT_FOUND) from exc
-    if manifest["status"] != "ready":
-        raise CliError(f"run {manifest['run_id']} is {manifest['status']}, not ready", EXIT_INPUT)
-    result = _set_active(store, manifest["run_id"], actor, "activate")
+    with store.locked():
+        run_id = _check_target(store, _resolve(store, args.run))
+        result = _set_active(store, run_id, actor, "activate")
     return {"active": result, "message": "takes effect in the next session (restart or reload the model server)"}
 
 
 def cmd_rollback(args: argparse.Namespace) -> dict[str, Any]:
     store = _store(args)
     actor = _check_may_activate(store, args)
-    if args.to == "base":
-        target = None
-    elif args.to == "previous":
-        stack = _activation_stack(store.active().get("history", []))
-        if len(stack) < 2:
-            raise CliError("nothing earlier to roll back to", EXIT_INPUT)
-        target = stack[-2]
-    else:
-        try:
-            manifest = store.resolve_run(args.to)
-        except LookupError as exc:
-            raise CliError(str(exc), EXIT_NOT_FOUND) from exc
-        if manifest["status"] != "ready":
-            raise CliError(f"run {manifest['run_id']} is {manifest['status']}, not ready", EXIT_INPUT)
-        target = manifest["run_id"]
-    result = _set_active(store, target, actor, "rollback", to=args.to if args.to in ("previous", "base") else "run")
-    return {"active": result, "message": "takes effect in the next session"}
+    with store.locked():
+        undid = None
+        if args.to == "base":
+            target = None
+        elif args.to == "previous":
+            stack = _activation_stack(store.active().get("history", []))
+            if len(stack) < 2:
+                raise CliError("nothing earlier to roll back to", EXIT_INPUT)
+            target = stack[-2]
+            undid = "the rollback to base" if stack[-1] is None else stack[-1]
+        else:
+            target = _resolve(store, args.to)["run_id"]
+        if target is not None:
+            _check_target(store, _resolve(store, target))
+        result = _set_active(store, target, actor, "rollback",
+                             to=args.to if args.to in ("previous", "base") else "run")
+    message = "takes effect in the next session"
+    if undid:
+        message = f"undid {undid}; now on {target or 'base'}; {message}"
+    return {"active": result, "message": message}
 
 
 def cmd_serve_cmd(args: argparse.Namespace) -> dict[str, Any]:
     store = _store(args)
     config = store.config()
+    with store.locked():
+        store.sync_active_link()
     active = store.active()
     cmd = ["vllm", "serve", config.serve_model, "--max-model-len", str(config.max_seq_length)]
     if active.get("run_id"):
+        mismatch = _model_mismatch(config, _resolve(store, active["run_id"]))
+        if mismatch:
+            raise CliError(f"active run {active['run_id']} {mismatch}; `afterlife rollback --to base` "
+                           "or activate a run trained for these models", EXIT_REFUSED)
         cmd += ["--enable-lora", "--max-lora-rank", "64",
-                "--lora-modules", f"afterlife={store.root / 'active-adapter'}"]
+                "--lora-modules", f"afterlife={store.active_link}"]
     return {"command": cmd, "model_name": "afterlife" if active.get("run_id") else config.serve_model,
-            "shell": " ".join(cmd)}
+            "shell": shlex.join(cmd)}
+
+
+def cmd_check_model(args: argparse.Namespace) -> dict[str, Any]:
+    if args.model:
+        base, serve = args.model, args.serve_model
+    else:
+        config = _store(args).config()
+        base, serve = config.base_model, args.serve_model or config.serve_model
+    try:
+        from afterlife.modelcheck import check_model
+    except ImportError as exc:
+        raise CliError(f"check-model needs the [train] extra ({exc})", EXIT_ERROR) from exc
+    try:
+        report = check_model(base, serve)
+    except ImportError as exc:
+        raise CliError(f"check-model needs the [train] extra ({exc})", EXIT_ERROR) from exc
+    except OSError as exc:
+        raise CliError(f"cannot load the tokenizer for {base}: {exc}", EXIT_NOT_FOUND) from exc
+    if report["status"] == "fail":
+        raise CliError(f"{base}: " + "; ".join(report["problems"]), EXIT_INPUT, **report)
+    return report
 
 
 def cmd_worker(args: argparse.Namespace) -> dict[str, Any]:
@@ -566,6 +673,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--set", action="append", metavar="KEY=VALUE", help="override a tunable parameter")
     sp.add_argument("--note")
 
+    sp = add("retry", cmd_retry, "queue a failed or interrupted training request again")
+    sp.add_argument("request_id")
+
     add("status", cmd_status, "strategy, counts, recent requests/runs, active adapter")
 
     sp = add("eval", cmd_eval, "show a run's evaluation")
@@ -581,6 +691,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--operator", action="store_true", help=argparse.SUPPRESS)
 
     add("serve-cmd", cmd_serve_cmd, "print a vLLM command that serves the active adapter")
+
+    sp = add("check-model", cmd_check_model,
+             "[operator] check a model's chat template works with afterlife (tokenizer only, no GPU)")
+    sp.add_argument("--model", help="checkpoint to check (default: the store's [model].base_model)")
+    sp.add_argument("--serve-model", help="full-precision model vLLM would serve it on")
 
     sp = add("worker", cmd_worker, "[operator] process pending training requests")
     sp.add_argument("--loop", action="store_true", help="keep polling instead of exiting")

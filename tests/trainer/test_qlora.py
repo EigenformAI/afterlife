@@ -496,6 +496,31 @@ class TestLoadSftDataset(unittest.TestCase):
         )
         self.assertTrue(all(1 in row["completion_mask"] for row in dataset))
 
+    def test_rehearsal_target_is_the_continuation_not_the_excerpt(self):
+        from afterlife.trainer.qlora import _load_sft_dataset
+
+        tokenizer = self._make_tokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl([self._make_row(prompt="hi", raw_response="ok")], path)
+            with patch("afterlife.trainer.qlora.load_dataset",
+                       return_value=[{"text": "FIRSTPART then SECONDPART"}]):
+                dataset = _load_sft_dataset(
+                    [path], tokenizer, rehearsal_dataset="demo/rehearsal",
+                    rehearsal_rows_per_epoch=1, rehearsal_prompt_chars=9,
+                )
+        row = next(r for r in dataset if "Continue" in "".join(map(chr, r["input_ids"])))
+        target = "".join(chr(t) for t, m in zip(row["input_ids"], row["completion_mask"]) if m)
+        self.assertIn("then SECONDPART", target)
+        self.assertNotIn("FIRSTPART", target)
+
+    def test_train_sft_rejects_weight_normalization_without_dft_weights(self):
+        from afterlife.trainer.qlora import train_sft
+
+        with self.assertRaisesRegex(ValueError, "needs DFT weights"):
+            train_sft(base_model="m", training_data_paths=[], output_dir="out",
+                      inner_loss="asft", asft_mode="sft+kl", asft_normalize_by="weights")
+
     @patch("afterlife.trainer.qlora.logger.warning")
     def test_warn_if_dataset_would_truncate_suggests_preserving_length(
         self,

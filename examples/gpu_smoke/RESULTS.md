@@ -35,8 +35,9 @@ An answer cut off mid-thought scores 0 recall (see the unfinished column).
 ## Reading
 
 - **SFT** learns new facts abruptly. At 5e-5 x 40 steps it reaches held-out loss
-  1.55 but recalls nothing. At 2e-4 x 40 it recalls everything word for word,
-  and the facts start leaking into unrelated answers ("each answer a bookmark
+  1.55 but recalls nothing. At 2e-4 x 40 it recalls two of the three facts
+  word for word (the signoff never came back at greedy decoding), and the
+  facts start leaking into unrelated answers ("each answer a bookmark
   waiting to be rediscovered").
 - **DFT** learns the *shape* of the answers but not the new content:
   "Noted. I'll keep it brief. —D" instead of "— onward, Lantern"; "Fennville,
@@ -53,4 +54,6 @@ measured on self-generated trajectories, i.e. content the model already finds
 likely. For content the model finds unlikely, SFT is the only one of the three
 that learned it here, and the hardest to dose.
 
-Caveats: 24 training rows, one seed, greedy probes, keyword scoring.
+Caveats: 24 training rows, one seed, greedy probes, keyword scoring. Rows
+were short, so the peak memory figures are not what full 4096-token batches
+would need.

@@ -98,15 +98,37 @@ Restart or reload the server after either one.
 | Training | Unsloth + TRL + PEFT LoRA, from NSL2's trainer (see [VENDORED.md](VENDORED.md)) |
 | Methods | `sft`, `dft`, `asft`. Agent picks one per request. |
 | Inference | vLLM (tested 0.32) with `--enable-lora`; needs `ninja` on `PATH` for its JIT kernels |
-| Hardware | Qwen3-8B, 4096-token context: training peaks at ~8 GB (SFT/DFT), ~8.4 GB (ASFT); eval ~19 GB with 2048-token probes. A 24 GB card is enough. Each run records `peak_gpu_gb` in its manifest. |
+| Hardware | Qwen3-8B, 4096-token window but short rows (the smoke test): training peaked at ~8 GB (SFT/DFT), ~8.4 GB (ASFT); eval ~19 GB with 2048-token probes. Long rows need more. Each run records `peak_gpu_gb` in its manifest. |
 
 Current vLLM can't load bitsandbytes checkpoints, which is why training and
 serving use different copies of the same model. `afterlife init --model X`
 fills in `serve_model` for known checkpoints; otherwise set it yourself.
 
-**Thinking models:** only the final answer carries loss. The template's
+**Other models:** only Qwen3 and Qwen2.5 have been trained end to end. Before
+trying another, run `afterlife check-model --model X` (needs the `[train]`
+extra, downloads the tokenizer only). It renders a few conversations the way
+the trainer and evaluator do, and reports whether the loss lands on the answer
+alone, what scaffold the template inserts, whether the model sees the same
+turn opening at inference as in training, and whether system prompts and tool
+calls are accepted. Tokenizer-only results from October 2026:
+
+| model | result |
+|---|---|
+| Qwen3, Qwen2.5 | ok (Qwen3: empty think block masked) |
+| Llama 3.2, Phi-4-mini, gpt-oss | ok (gpt-oss: final-channel header masked) |
+| Mistral Small 3.2 | ok |
+| Gemma 3 | ok, but no tool role |
+| DeepSeek-R1-Distill | warn: inference opens a `<think>` block that training doesn't, so answer-only memories don't match how it's prompted |
+
+A pass means the template is handled consistently. Whether Unsloth trains the
+model, vLLM serves its LoRA, and training helps still needs a GPU run.
+
+**Thinking models:** the loss is on the answer itself. The template's
 scaffold before it (an empty `<think></think>` for Qwen3) is treated as
-prompt, so adapters don't learn to skip thinking. Probe answers in `eval`
+prompt, so adapters aren't trained to skip thinking. If a template renders
+the answer so it can't be found on a token boundary, the trainer falls back
+to including the scaffold and logs how many rows that hit. Masking the
+scaffold doesn't prove reasoning is unchanged, so read the probes. Probe answers in `eval`
 are stored with `thinking` and `answer` separated. Raise
 `[eval].probe_max_new_tokens` if `probes_unfinished` shows answers being cut
 off mid-thought.
@@ -170,15 +192,18 @@ All of this lives in `.afterlife/config.toml`:
   trainable, and how much is held out for evaluation. `eval_fraction` applies
   only to experiences picked by an agent's mode or policy, re-split per
   request. Explicit nominations are never held out; experiences an agent
-  marks `eval_only` always are.
+  marks `eval_only` always are. See Limitations for when held-out results
+  mean anything.
 - `rehearsal_dataset`: optionally mix in general text to limit forgetting.
 
 Boundaries that hold whatever an agent asks for:
 
 - Policies are JSON data evaluated by a fixed set of predicates. Agent-written
   code is never run.
-- Experiences that look like they contain credentials are refused before they
-  reach disk.
+- Experiences whose messages or metadata (source, tags, verification notes,
+  ids, decision reasons) match common credential patterns are refused before
+  they reach disk. This is a pattern check that catches accidents, not a
+  guarantee that nothing sensitive gets through.
 - The base model is never modified. Adapters are separate, versioned
   directories under `runs/`.
 - `train --request` only queues a request. Training runs when *you* start the
@@ -213,8 +238,11 @@ out.
 
 - Only smoke-tested on GPU: one 28-example synthetic set, 40 steps per method.
 - Each run starts from the base model; adapters don't stack.
-- The selection is frozen when an agent makes the request; later changes
-  don't affect a queued run.
+- The selection and the agent's `--set` overrides are frozen when the
+  request is made; later selection changes don't affect a queued run. The
+  operator's current rules still apply when it runs: an experience they no
+  longer allow is dropped (with the reason), never replaced. Defaults, limits,
+  models and eval settings are read at run time and recorded in the run.
 - Experiences carry the answer only. A thinking model's reasoning isn't
   trained on.
 - Each target turn (the final assistant turn, or each turn marked
@@ -231,9 +259,12 @@ out.
 - Duplicate detection is exact after normalising case and whitespace.
   Near-duplicates get through.
 - Held-out loss is only informative when memories share a pattern (a style,
-  a procedure, the same fact asked different ways). Most things an agent
-  picks while exploring are one-offs, so the recall answers are usually the
-  better check.
+  a procedure, the same fact asked different ways). If the data is too
+  diffuse, held-out results probably don't mean much: a one-off memory can't
+  be predicted from the others. Most things an agent picks while exploring
+  are one-offs, so the recall answers are usually the better check. Whole
+  sessions are held out, so with few sessions the share held out can be far
+  above `eval_fraction`; `preview` shows `heldout_fraction_effective`.
 - No promise that a selected memory improves anything. Check `eval` first.
 
 ## Development

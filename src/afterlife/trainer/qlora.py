@@ -482,13 +482,16 @@ def _is_gemma_vlm_processor(tokenizer: Any) -> bool:
 
 
 def _encode_text(tokenizer: Any, text: str) -> dict[str, list[int]]:
+    # Afterlife: text here is already rendered by the chat template, which adds
+    # any BOS itself. Adding special tokens again would double it on tokenizers
+    # that also prepend BOS, and differ from probe generation (evaluator.py).
     try:
-        encoded = tokenizer(text=text, truncation=False, padding=False)
+        encoded = tokenizer(text=text, truncation=False, padding=False, add_special_tokens=False)
     except Exception:  # noqa: BLE001 - VLM processors and text tokenizers differ here.
         text_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
         if text_tokenizer is tokenizer:
             raise
-        encoded = text_tokenizer(text, truncation=False, padding=False)
+        encoded = text_tokenizer(text, truncation=False, padding=False, add_special_tokens=False)
 
     row: dict[str, list[int]] = {}
     for key in SEQUENCE_FEATURE_KEYS:
@@ -550,6 +553,22 @@ def _build_query_response_sft_row(
     # thinking models from learning "skip thinking" from answer-only examples.
     # Falls back to the NSL2 boundary below when the response text cannot be
     # located on a token boundary in the rendered conversation.
+    row = _answer_only_sft_row(tokenizer, prompt=prompt, raw_response=raw_response, context=context)
+    if row is not None:
+        return row
+    return _build_query_response_sft_row_nsl(
+        tokenizer, prompt=prompt, raw_response=raw_response, context=context
+    )
+
+
+def _answer_only_sft_row(
+    tokenizer: Any,
+    *,
+    prompt: str | None = None,
+    raw_response: str,
+    context: Sequence[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """The answer-only masked row, or None when the response can't be located on a token boundary."""
     messages = _context_messages(prompt, context)
     full_text = tokenizer.apply_chat_template(
         messages + [{"role": "assistant", "content": raw_response}],
@@ -574,9 +593,7 @@ def _build_query_response_sft_row(
             )
             row["length"] = len(input_ids)
             return row
-    return _build_query_response_sft_row_nsl(
-        tokenizer, prompt=prompt, raw_response=raw_response, context=context
-    )
+    return None
 
 
 def _build_query_response_sft_row_nsl(
@@ -788,6 +805,7 @@ def _load_self_generated_sft_rows(
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     dropped_fully_truncated = 0
+    mask_fallbacks = 0
     for training_data_path in training_data_paths:
         resolved_path = Path(training_data_path).expanduser().resolve()
         with open(resolved_path, "r", encoding="utf-8") as handle:
@@ -815,12 +833,14 @@ def _load_self_generated_sft_rows(
                 # Keep one full-conversation encoding to avoid the Gemma 4
                 # prompt/completion concat crash, but attach an explicit mask so
                 # only response tokens contribute to the loss.
-                row = _build_query_response_sft_row(
-                    tokenizer,
-                    prompt=prompt,
-                    raw_response=raw_response,
-                    context=context,
+                row = _answer_only_sft_row(
+                    tokenizer, prompt=prompt, raw_response=raw_response, context=context
                 )
+                if row is None:  # Afterlife: count it, the fallback also trains on scaffold tokens
+                    mask_fallbacks += 1
+                    row = _build_query_response_sft_row_nsl(
+                        tokenizer, prompt=prompt, raw_response=raw_response, context=context
+                    )
                 # Drop rows whose prompt alone fills the sequence window: after the
                 # collator truncates to the first max_seq_length tokens, no response
                 # token survives, so every label is IGNORE_INDEX. Such a row carries
@@ -841,6 +861,13 @@ def _load_self_generated_sft_rows(
             dropped_fully_truncated,
             max_seq_length,
             len(rows),
+        )
+    if mask_fallbacks:
+        logger.warning(
+            "{} row(s) could not be masked to the answer alone (response text not on a "
+            "token boundary in the rendered template); their loss also covers the "
+            "assistant-turn scaffold, e.g. an empty <think></think> block.",
+            mask_fallbacks,
         )
     return rows
 
@@ -942,16 +969,16 @@ def _load_rehearsal_sft_rows(
 
         epoch_rows: list[dict[str, Any]] = []
         for text in selected_texts:
+            # Afterlife: the target is what follows the excerpt, not the whole
+            # passage, so "continue" is the task actually trained.
             excerpt = text[:prompt_chars].rstrip()
-            row_prompt = prompt.rstrip()
-            if excerpt:
-                row_prompt += f":\n\n{excerpt}"
-            else:
-                row_prompt += "."
+            continuation = text[len(excerpt):].strip()
+            if not excerpt or not continuation:
+                continue
             row = _build_query_response_sft_row(
                 tokenizer,
-                prompt=row_prompt,
-                raw_response=text,
+                prompt=f"{prompt.rstrip()}:\n\n{excerpt}",
+                raw_response=continuation,
             )
             if not _completion_survives_truncation(
                 row,
@@ -1081,6 +1108,21 @@ def train_sft(
             "Training checkpointing is only supported for LoRA adapter exports. "
             "Use export_format='lora' for checkpointed runs, then perform any "
             "larger merged_16bit or GGUF export from the final adapter."
+        )
+
+    # Afterlife: reject or flag ASFT settings before the model loads, not at the first step.
+    if inner_loss == "asft" and asft_normalize_by == "weights" and asft_mode not in ("dft", "asft"):
+        raise ValueError(
+            f"asft_normalize_by='weights' needs DFT weights, which asft_mode={asft_mode!r} "
+            "does not compute; use 'tokens', or asft_mode 'dft' or 'asft'."
+        )
+    if inner_loss == "asft" and (asft_streaming != "off" or asft_ref_microbatch_size is not None):
+        logger.warning(
+            "asft_streaming={} / asft_ref_microbatch_size={} have no effect: the reference "
+            "forward always runs in full and only the KL is chunked (asft_seq_chunk_size). "
+            "These settings are kept for NSL2 compatibility and may be removed.",
+            asft_streaming,
+            asft_ref_microbatch_size,
         )
 
     if inner_loss == "dft" and dft_impl == "fused":

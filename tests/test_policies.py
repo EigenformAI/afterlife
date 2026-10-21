@@ -85,3 +85,16 @@ def test_recent_sessions_counts_sessions_the_agent_already_decided_on():
     undecided = pool[:2]  # the agent has already nominated the newest session's experience
     ids, _ = evaluate_policy(validate_policy({"include": [{"recent_sessions": 1}]}), undecided, pool)
     assert ids == []  # s3 is the most recent session, not s2
+
+
+def test_same_second_ties_go_to_the_later_record():
+    pool = _pool(("old", {"session": "s1"}), ("new", {"session": "s2"}))
+    for e in pool:
+        e["created_at"] = "2026-01-01T00:00:00Z"  # one batch, one second
+    assert _select({"include": [{"recent_sessions": 1}]}, pool)[0] == ["new"]
+    assert _select({"order_by": "recent"}, pool)[0] == ["new", "old"]
+
+
+def test_random_order_depends_on_the_seed():
+    pool = _pool(*POOL)
+    assert _select({"order_by": "random", "seed": 1}, pool)[0] != _select({"order_by": "random", "seed": 2}, pool)[0]

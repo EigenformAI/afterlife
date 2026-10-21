@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import unicodedata
 from typing import Any
 
@@ -22,6 +23,7 @@ ROLES = {"system", "user", "assistant", "tool"}  # tool turns are context only, 
 MESSAGE_EXTRAS = ("tool_calls", "tool_call_id", "name")
 DECISIONS = ("nominate", "reject", "defer", "external-memory-only")
 VERIFICATION_STATUSES = ("unverified", "verified", "failed")
+EXPERIENCE_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 
 # Things that should never land in a training set. Deliberately conservative:
 # a false positive costs the agent a rewrite, a false negative leaks a key into
@@ -75,6 +77,9 @@ def check_messages(messages: Any) -> list[str]:
             problems.append(f"messages[{i}].train must be true or false")
         elif m.get("train") and m.get("role") != "assistant":
             problems.append(f"messages[{i}]: only assistant turns can be marked train")
+        for key in ("tool_call_id", "name"):
+            if key in m and not isinstance(m[key], str):
+                problems.append(f"messages[{i}].{key} must be a string")
     if problems:
         return problems
     for i in target_turns(messages):
@@ -98,13 +103,20 @@ def target_turns(messages: list[dict[str, Any]]) -> list[int]:
 
 
 def dedup_key(messages: list[dict[str, Any]]) -> str:
-    """Hash of the conversation with case/whitespace/unicode-form normalised."""
+    """Hash of the conversation with case/whitespace/unicode-form normalised.
+
+    Which turns are trained is part of the key: the same conversation learned
+    at a different turn is a different example. Tool-use fields count too.
+    """
+    targets = set(target_turns(messages))
     norm = [
         {
             "role": m["role"],
             "content": " ".join(unicodedata.normalize("NFKC", m["content"]).lower().split()),
+            "train": i in targets,
+            **{k: m[k] for k in MESSAGE_EXTRAS if k in m},
         }
-        for m in messages
+        for i, m in enumerate(messages)
     ]
     return sha256_json(norm)[:16]
 
@@ -116,14 +128,19 @@ def build_experience(payload: dict[str, Any]) -> dict[str, Any]:
 
         {"messages": [...], "tags": [...], "priority": 0.7, "session_id": "s1"}
 
-    or the nested form from the engineering brief (``training_candidate`` /
-    ``selection`` / ``source``). Raises ValidationError on anything that must not
+    or the nested form (``training_candidate`` / ``selection`` / ``source``). Raises ValidationError on anything that must not
     be stored at all (bad structure, likely secrets).
     """
     if not isinstance(payload, dict):
         raise ValidationError(["experience must be a JSON object"])
+    problems = [f"{key} must be an object" for key in ("training_candidate", "selection", "source", "verification")
+                if payload.get(key) is not None and not isinstance(payload[key], dict)]
+    if problems:
+        raise ValidationError(problems)
 
     candidate = payload.get("training_candidate") or {}
+    if candidate.get("verification") is not None and not isinstance(candidate["verification"], dict):
+        raise ValidationError(["training_candidate.verification must be an object"])
     selection = payload.get("selection") or {}
     source = dict(payload.get("source") or {})
     if "session_id" in payload:
@@ -132,6 +149,16 @@ def build_experience(payload: dict[str, Any]) -> dict[str, Any]:
         source.setdefault("trajectory_ref", payload["trajectory_ref"])
     if "url" in payload:
         source.setdefault("url", payload["url"])
+    # Readers group, hash and print these, so anything but a string poisons the store.
+    problems = [f"source.{k} must be a non-empty string" for k in ("session_id", "trajectory_ref", "url")
+                if source.get(k) is not None and not (isinstance(source[k], str) and source[k])]
+    problems += [f"source.{k} must be a string, number, true/false or null" for k, v in source.items()
+                 if not isinstance(v, (str, int, float, bool, type(None)))]
+    experience_id = payload.get("experience_id")
+    if experience_id is not None and not (isinstance(experience_id, str) and EXPERIENCE_ID.fullmatch(experience_id)):
+        problems.append("experience_id must be 1-128 letters, digits, '.', '_', ':' or '-'")
+    if problems:
+        raise ValidationError(problems)
 
     messages = candidate.get("messages", payload.get("messages"))
     problems = check_messages(messages)
@@ -165,12 +192,13 @@ def build_experience(payload: dict[str, Any]) -> dict[str, Any]:
     eval_only = payload.get("eval_only", False)
     if not isinstance(eval_only, bool):
         raise ValidationError(["eval_only must be true or false"])
-    embedded_decision(payload)  # validate before anything is stored
+    decision = embedded_decision(payload)  # validate before anything is stored
 
-    return {
+    record = {
         "schema_version": SCHEMA_VERSION,
-        "experience_id": payload.get("experience_id") or new_id("exp"),
+        "experience_id": experience_id or new_id("exp"),
         "created_at": utc_now(),
+        "created_ns": time.time_ns(),  # orders records made within the same second
         "source": source,
         "kind": kind,
         "tags": sorted(set(tags)),
@@ -180,6 +208,14 @@ def build_experience(payload: dict[str, Any]) -> dict[str, Any]:
         "dedup_key": dedup_key(messages),
         "chars": len(messages_text(messages)),
     }
+    # Messages were scanned above with a clearer message; this covers everything
+    # else that is persisted: source, tags, verification notes, ids, the reason.
+    secrets_found = find_secrets(json.dumps([record, decision], ensure_ascii=False))
+    if secrets_found:
+        raise ValidationError(
+            [f"metadata looks like it contains a secret ({', '.join(secrets_found)}); remove it and retry"]
+        )
+    return record
 
 
 def embedded_decision(payload: dict[str, Any]) -> tuple[str, str | None] | None:
@@ -207,6 +243,8 @@ def build_decision(
 ) -> dict[str, Any]:
     if decision not in DECISIONS:
         raise ValidationError([f"decision must be one of {DECISIONS}"])
+    if reason and find_secrets(reason):
+        raise ValidationError(["reason looks like it contains a secret; remove it and retry"])
     return {
         "decision_id": new_id("dec"),
         "experience_id": experience_id,

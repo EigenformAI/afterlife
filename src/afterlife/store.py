@@ -9,6 +9,7 @@
       requests/<id>.json   training requests and their status
       runs/<run-id>/       manifest.json, train.jsonl, heldout.jsonl, eval.json, adapter/
       active.json          which adapter is live, plus history for rollback
+      active-adapter       symlink to the live adapter, derived from active.json
 """
 
 from __future__ import annotations
@@ -18,10 +19,11 @@ import hashlib
 import json
 import os
 import secrets
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from afterlife.config import Config, load_config
 
@@ -109,7 +111,12 @@ class Store:
 
     # -- append-only logs ----------------------------------------------------
     @contextmanager
-    def _locked(self) -> Iterator[None]:
+    def locked(self) -> Iterator[None]:
+        """Hold the store lock across a read-check-write sequence.
+
+        Not reentrant: append/append_many take the same lock, so do not call
+        them inside.
+        """
         self.root.mkdir(parents=True, exist_ok=True)
         with open(self.root / ".lock", "a+", encoding="utf-8") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -120,10 +127,25 @@ class Store:
 
     def append(self, path: Path, record: dict[str, Any]) -> None:
         line = json.dumps(record, ensure_ascii=False) + "\n"
-        with self._locked(), open(path, "a", encoding="utf-8") as handle:
+        with self.locked(), open(path, "a", encoding="utf-8") as handle:
             handle.write(line)
             handle.flush()
             os.fsync(handle.fileno())
+
+    def append_many(self, path: Path, choose: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
+        """Append the records ``choose()`` returns, deciding and writing under one lock.
+
+        ``choose`` runs with the lock held, so it sees every earlier write and
+        no other writer can get in between; it may raise to write nothing.
+        Returns what was written.
+        """
+        with self.locked():
+            records = choose()
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records))
+                handle.flush()
+                os.fsync(handle.fileno())
+        return records
 
     @staticmethod
     def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -163,10 +185,18 @@ class Store:
     # -- mutable JSON documents (atomic replace) -----------------------------
     @staticmethod
     def write_json(path: Path, payload: Any) -> None:
+        # A temp file per writer: a shared one lets concurrent writers replace each other's.
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
 
     @staticmethod
     def read_json(path: Path, default: Any = None) -> Any:
@@ -189,7 +219,7 @@ class Store:
 
     def runs(self) -> list[dict[str, Any]]:
         manifests = [self.read_json(p) for p in self.runs_dir.glob("*/manifest.json")]
-        return sorted((m for m in manifests if m), key=lambda m: m["created_at"])
+        return sorted((m for m in manifests if m), key=lambda m: (m["created_at"], m.get("created_ns", 0)))
 
     def resolve_run(self, ref: str) -> dict[str, Any]:
         runs = self.runs()
@@ -204,3 +234,26 @@ class Store:
 
     def active(self) -> dict[str, Any]:
         return self.read_json(self.active_path, {"run_id": None, "adapter_path": None, "history": []})
+
+    @property
+    def active_link(self) -> Path:
+        return self.root / "active-adapter"
+
+    def sync_active_link(self) -> None:
+        """Point active-adapter at what active.json says, repairing a crash between the two.
+
+        active.json is the record; the symlink is what the model server reads.
+        The swap is a rename, so a reader never sees the link missing mid-switch.
+        """
+        run_id = self.active().get("run_id")
+        link = self.active_link
+        if run_id is None:
+            if link.is_symlink() or link.exists():
+                link.unlink()
+            return
+        target = Path("runs") / run_id / "adapter"
+        if link.is_symlink() and Path(os.readlink(link)) == target:
+            return
+        tmp = self.root / f".active-adapter.{secrets.token_hex(4)}"
+        tmp.symlink_to(target)
+        os.replace(tmp, link)

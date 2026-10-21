@@ -22,8 +22,8 @@ from typing import Any
 
 from afterlife.config import Config
 from afterlife.policies import current_strategy, evaluate_policy, order_experiences
-from afterlife.schemas import MESSAGE_EXTRAS, check_messages, find_secrets, messages_text, target_turns
-from afterlife.store import Store
+from afterlife.schemas import MESSAGE_EXTRAS, check_messages, dedup_key, find_secrets, messages_text, target_turns
+from afterlife.store import Store, sha256_json
 
 EXCLUDING_DECISIONS = {"reject", "defer", "external-memory-only"}
 
@@ -85,6 +85,30 @@ def _heldout_sessions(experiences: list[dict[str, Any]], fraction: float, seed: 
     return set(ranked[:n])
 
 
+def content_hash(e: dict[str, Any]) -> str:
+    """Fingerprint of what would be trained, so a frozen id can be checked against its content."""
+    return sha256_json(e["training_candidate"])[:16]
+
+
+def admission_problem(e: dict[str, Any], op: Any) -> str | None:
+    """Why the operator's current rules keep an experience out of a run, or None.
+
+    Applied both when a selection is built and when the worker trains a
+    request frozen earlier, so rules tightened in between still hold.
+    """
+    messages = e["training_candidate"]["messages"]
+    problems = check_messages(messages)
+    if problems:
+        return "invalid: " + "; ".join(problems)
+    if find_secrets(messages_text(messages)):
+        return "invalid: possible secret"
+    if e["chars"] > op.max_example_chars:
+        return f"too long: {e['chars']} chars > {op.max_example_chars}"
+    if op.require_verified and e["training_candidate"]["verification"]["status"] != "verified":
+        return "operator requires verified examples"
+    return None
+
+
 def build_training_set(store: Store, config: Config, split_seed: str = "") -> dict[str, Any]:
     sel = select(store)
     op = config.operator
@@ -94,19 +118,12 @@ def build_training_set(store: Store, config: Config, split_seed: str = "") -> di
     for e in sel["selected"] + sel["eval_only"]:
         eid = e["experience_id"]
         messages = e["training_candidate"]["messages"]
-        problems = check_messages(messages)
-        if problems:
-            excluded[eid] = "invalid: " + "; ".join(problems)
-        elif find_secrets(messages_text(messages)):
-            excluded[eid] = "invalid: possible secret"
-        elif e["chars"] > op.max_example_chars:
-            excluded[eid] = f"too long: {e['chars']} chars > {op.max_example_chars}"
-        elif op.require_verified and e["training_candidate"]["verification"]["status"] != "verified":
-            excluded[eid] = "operator requires verified examples"
-        elif e["dedup_key"] in seen:
-            excluded[eid] = f"duplicate of {seen[e['dedup_key']]}"
+        if (problem := admission_problem(e, op)) is not None:
+            excluded[eid] = problem
+        elif (key := dedup_key(messages)) in seen:  # recomputed: stored keys may predate the current hash
+            excluded[eid] = f"duplicate of {seen[key]}"
         else:
-            seen[e["dedup_key"]] = eid
+            seen[key] = eid
             valid.append(e)
 
     explicit = set(sel["explicit_ids"])
@@ -130,6 +147,7 @@ def build_training_set(store: Store, config: Config, split_seed: str = "") -> di
         excluded[e["experience_id"]] = f"over budget ({op.max_examples_per_run} per run)"
     train = ordered[: op.max_examples_per_run]
 
+    heldout_ids = {e["experience_id"] for e in heldout}
     return {
         "mode": sel["mode"],
         "policy_hash": sel["policy_hash"],
@@ -143,6 +161,12 @@ def build_training_set(store: Store, config: Config, split_seed: str = "") -> di
             "train": len(train),
             "heldout": len(heldout),
             "heldout_eval_only": sum(1 for e in heldout if e["experience_id"] in eval_ids),
+            # Whole sessions are held out, so the share actually held out of the
+            # splittable picks (not nominated, not eval_only) can be far from eval_fraction.
+            "heldout_fraction_target": op.eval_fraction,
+            "heldout_fraction_effective": round(
+                sum(1 for e in splittable if e["experience_id"] in heldout_ids) / len(splittable), 3
+            ) if splittable else 0.0,
             "train_chars": sum(e["chars"] for e in train),
             "train_rows": sum(len(target_turns(e["training_candidate"]["messages"])) for e in train),
         },

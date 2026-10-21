@@ -17,21 +17,26 @@ import hashlib
 import json
 import os
 import platform
+import signal
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from afterlife.config import Config
 from afterlife.recipes import resolve_recipe, rows_per_pass, train_sft_kwargs
-from afterlife.selection import build_training_set, to_trainer_rows
+from afterlife.selection import admission_problem, build_training_set, content_hash, to_trainer_rows
 from afterlife.store import Store, new_id, utc_now
 
 
 class WorkerError(Exception):
     pass
+
+
+class CooldownWait(WorkerError):
+    """The operator's minimum gap between runs has not passed; the request stays pending."""
 
 
 def _sha256_file(path: Path) -> str:
@@ -48,12 +53,12 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def _minutes_since_last_run(store: Store) -> float | None:
-    runs = [r for r in store.runs() if r.get("status") != "failed"]
+def _last_run_at(store: Store) -> datetime | None:
+    # Failed runs and dry runs trained nothing, so they do not start the cooldown.
+    runs = [r for r in store.runs() if r.get("status") not in ("failed", "interrupted", "dry_run")]
     if not runs:
         return None
-    last = datetime.strptime(runs[-1]["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - last).total_seconds() / 60
+    return datetime.strptime(runs[-1]["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 
 
 def _set_request(store: Store, request: dict[str, Any], status: str, **extra: Any) -> None:
@@ -62,18 +67,39 @@ def _set_request(store: Store, request: dict[str, Any], status: str, **extra: An
 
 
 def _frozen_training_set(store: Store, config: Config, request: dict[str, Any]) -> dict[str, Any] | None:
-    """Rebuild the training set the agent saw at request time, under current caps."""
+    """Rebuild the training set the agent saw at request time, under the operator's current rules.
+
+    Membership is fixed at request time: nothing is added from later store
+    contents. A member the current rules no longer allow, or whose content no
+    longer matches what was requested, is dropped with the reason, not replaced.
+    """
     frozen = request.get("frozen_selection")
     if not frozen:
         return None
+    op = config.operator
     by_id = {e["experience_id"]: e for e in store.experiences()}
-    cap = config.operator.max_examples_per_run
+    hashes = frozen.get("content_hashes", {})  # absent on requests queued by older versions
     excluded = dict(frozen["excluded"])
-    train = [by_id[i] for i in frozen["train_ids"] if i in by_id]
-    for e in train[cap:]:
-        excluded[e["experience_id"]] = f"over budget ({cap} per run)"
-    train = train[:cap]
-    heldout = [by_id[i] for i in frozen["heldout_ids"] if i in by_id]
+
+    def admit(ids: list[str]) -> list[dict[str, Any]]:
+        kept = []
+        for i in ids:
+            e = by_id.get(i)
+            if e is None:
+                excluded[i] = "no longer in the store"
+            elif i in hashes and content_hash(e) != hashes[i]:
+                excluded[i] = "content changed since the request was queued"
+            elif (problem := admission_problem(e, op)) is not None:
+                excluded[i] = f"no longer allowed: {problem}"
+            else:
+                kept.append(e)
+        return kept
+
+    train = admit(frozen["train_ids"])
+    for e in train[op.max_examples_per_run :]:
+        excluded[e["experience_id"]] = f"over budget ({op.max_examples_per_run} per run)"
+    train = train[: op.max_examples_per_run]
+    heldout = admit(frozen["heldout_ids"])
     strategy = request.get("strategy_at_request", {})
     return {
         "mode": strategy.get("mode"),
@@ -112,12 +138,16 @@ def prepare_run(store: Store, config: Config, request: dict[str, Any]) -> Path:
     manifest = {
         "run_id": run_id,
         "created_at": utc_now(),
+        "created_ns": time.time_ns(),
         "status": "prepared",
         "request_id": request["request_id"],
         "request_note": request.get("note"),
         "base_model": config.base_model,
+        "serve_model": config.serve_model,  # activation refuses this adapter if either model changes
         "starts_from": "base",  # each run trains a fresh adapter from the base model
-        "active_at_request": active.get("run_id"),
+        # Evaluated as "current": the adapter live when the run was prepared
+        # (the request records the one live when it was queued).
+        "active_at_run": active.get("run_id"),
         "selection": {"mode": ts["mode"], "policy_hash": ts["policy_hash"],
                       "counts": {**ts["counts"], "train_rows": len(train_rows)}},
         "recipe": recipe,
@@ -142,28 +172,66 @@ def _update_manifest(store: Store, run_dir: Path, **fields: Any) -> dict[str, An
     return manifest
 
 
-def _child(step: str, run_dir: Path) -> None:
+def _child(step: str, run_dir: Path, lock_fd: int | None = None) -> None:
+    # The child inherits the worker lock (flock follows the open file), so if
+    # the worker dies mid-run, no new worker can start until the child is done
+    # with the GPU. On an exception here (Ctrl-C included) subprocess.run kills it.
     cmd = [sys.executable, "-m", "afterlife.worker", step, str(run_dir)]
     with open(run_dir / f"{step}.log", "a", encoding="utf-8") as log:
-        proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
+        proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT,
+                              pass_fds=(lock_fd,) if lock_fd is not None else ())
     if proc.returncode != 0:
         raise WorkerError(f"{step} failed (exit {proc.returncode}); see {run_dir / f'{step}.log'}")
 
 
-def process_request(store: Store, request: dict[str, Any], *, dry_run: bool = False) -> dict[str, Any]:
+def _ended(exc: BaseException) -> str:
+    """A worker stopped by Ctrl-C or SIGTERM was interrupted; anything else failed."""
+    return "interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed"
+
+
+def recover_interrupted(store: Store) -> list[dict[str, Any]]:
+    """Mark work left mid-flight by a worker that died as interrupted. Call with the worker lock held.
+
+    Holding the lock means no worker or training child is still running, so
+    anything still "preparing" or "running" was abandoned. It is never
+    retrained automatically: `afterlife retry` queues it again.
+    """
+    recovered = []
+    for request in store.requests():
+        if request["status"] not in ("preparing", "running"):
+            continue
+        error = f"worker stopped while {request['status']}; `afterlife retry {request['request_id']}` to queue it again"
+        if request.get("run_id"):
+            run_dir = store.run_dir(request["run_id"])
+            manifest = store.read_json(run_dir / "manifest.json")
+            if manifest and manifest.get("status") in ("prepared", "training", "evaluating"):
+                _update_manifest(store, run_dir, status="interrupted",
+                                 error=f"worker stopped while {manifest['status']}")
+        _set_request(store, request, "interrupted", error=error)
+        recovered.append({"request_id": request["request_id"], "ok": False, "recovered": True, "error": error})
+    return recovered
+
+
+def process_request(store: Store, request: dict[str, Any], *, dry_run: bool = False,
+                    lock_fd: int | None = None) -> dict[str, Any]:
     config = store.config()
     if not config.operator.training_enabled:
         raise WorkerError("training is disabled by the operator ([operator].training_enabled)")
     gap = config.operator.min_minutes_between_runs
-    since = _minutes_since_last_run(store)
-    if gap and since is not None and since < gap:
-        raise WorkerError(f"last run was {since:.0f} min ago; operator minimum is {gap} min")
+    last = _last_run_at(store)
+    if gap and last is not None and datetime.now(timezone.utc) < last + timedelta(minutes=gap):
+        since = (datetime.now(timezone.utc) - last).total_seconds() / 60
+        eligible_at = (last + timedelta(minutes=gap)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        reason = f"last run was {since:.0f} min ago; operator minimum is {gap} min"
+        if request.get("eligible_at") != eligible_at:  # visible in `afterlife status`
+            _set_request(store, request, "pending", blocked_reason=reason, eligible_at=eligible_at)
+        raise CooldownWait(f"{reason}; waiting until {eligible_at}")
 
-    _set_request(store, request, "preparing")
+    _set_request(store, request, "preparing", blocked_reason=None, eligible_at=None)
     try:
         run_dir = prepare_run(store, config, request)
-    except Exception as exc:
-        _set_request(store, request, "failed", error=str(exc))
+    except BaseException as exc:
+        _set_request(store, request, _ended(exc), error=str(exc) or type(exc).__name__)
         raise
     run_id = run_dir.name
     _set_request(store, request, "running", run_id=run_id)
@@ -176,13 +244,13 @@ def process_request(store: Store, request: dict[str, Any], *, dry_run: bool = Fa
     started = time.time()
     try:
         _update_manifest(store, run_dir, status="training")
-        _child("train", run_dir)
+        _child("train", run_dir, lock_fd)
         _update_manifest(
             store, run_dir, status="evaluating", adapter_path=str(run_dir / "adapter"),
             train_seconds=round(time.time() - started, 1),
         )
         started = time.time()
-        _child("eval", run_dir)
+        _child("eval", run_dir, lock_fd)
         eval_report = store.read_json(run_dir / "eval.json")
         manifest = _update_manifest(
             store, run_dir, status="ready", eval=eval_report.get("summary"),
@@ -190,33 +258,58 @@ def process_request(store: Store, request: dict[str, Any], *, dry_run: bool = Fa
             peak_gpu_gb={step: (store.read_json(run_dir / f"{step}_stats.json") or {}).get("peak_gpu_gb")
                          for step in ("train", "eval")},
         )
-    except Exception as exc:
-        _update_manifest(store, run_dir, status="failed", error=str(exc))
-        _set_request(store, request, "failed", error=str(exc))
+    except BaseException as exc:
+        error = str(exc) or type(exc).__name__
+        _update_manifest(store, run_dir, status=_ended(exc), error=error)
+        _set_request(store, request, _ended(exc), error=error)
         raise
     _set_request(store, request, "done")
     return manifest
 
 
+def _process_pending(store: Store, waiting: set[str], *, dry_run: bool = False,
+                     lock_fd: int | None = None) -> list[dict[str, Any]]:
+    """One pass over the queue. ``waiting`` holds requests already reported as cooling down."""
+    results = []
+    for request in [r for r in store.requests() if r["status"] == "pending"]:
+        try:
+            results.append({"request_id": request["request_id"], "ok": True,
+                            "manifest": process_request(store, request, dry_run=dry_run, lock_fd=lock_fd)})
+        except CooldownWait as exc:
+            # Report a wait once, not every poll; the request stays pending.
+            if request["request_id"] not in waiting:
+                waiting.add(request["request_id"])
+                results.append({"request_id": request["request_id"], "ok": False,
+                                "waiting": True, "error": str(exc)})
+        except Exception as exc:  # one bad request must not stop the queue
+            results.append({"request_id": request["request_id"], "ok": False, "error": str(exc)})
+    return results
+
+
 def run_pending(store: Store, *, once: bool = True, dry_run: bool = False, poll_seconds: int = 30) -> list[dict[str, Any]]:
     """Process pending requests oldest first. One worker at a time per store."""
     results = []
+    waiting: set[str] = set()
     with open(store.root / ".worker.lock", "a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise WorkerError("another worker is already running on this store") from exc
-        while True:
-            pending = [r for r in store.requests() if r["status"] == "pending"]
-            for request in pending:
-                try:
-                    results.append({"request_id": request["request_id"], "ok": True,
-                                    "manifest": process_request(store, request, dry_run=dry_run)})
-                except Exception as exc:  # one bad request must not stop the queue
-                    results.append({"request_id": request["request_id"], "ok": False, "error": str(exc)})
-            if once:
-                return results
-            time.sleep(poll_seconds)
+            raise WorkerError("another worker, or a training process left by one, is running on this store") from exc
+        # SIGTERM (e.g. a pod shutting down) unwinds like Ctrl-C, so the run is marked interrupted.
+        previous = signal.signal(signal.SIGTERM, _raise_exit)
+        try:
+            results += recover_interrupted(store)
+            while True:
+                results += _process_pending(store, waiting, dry_run=dry_run, lock_fd=lock.fileno())
+                if once:
+                    return results
+                time.sleep(poll_seconds)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+
+
+def _raise_exit(signum: int, frame: Any) -> None:
+    raise SystemExit(128 + signum)
 
 
 # -- child-process entry points ------------------------------------------------

@@ -139,6 +139,41 @@ def test_dedup_key_normalises_case_and_whitespace():
     assert dedup_key(a) == dedup_key(b)
 
 
+def _convo(train_turn):
+    turns = [("user", "q1"), ("assistant", "a1"), ("user", "q2"), ("assistant", "a2")]
+    return [{"role": r, "content": c, **({"train": True} if i == train_turn else {})}
+            for i, (r, c) in enumerate(turns)]
+
+
+def test_dedup_key_counts_which_turns_are_trained():
+    assert dedup_key(_convo(1)) != dedup_key(_convo(3))
+    assert dedup_key(_convo(3)) == dedup_key(_convo(None))  # unmarked = last turn trained
+
+
+def test_dedup_key_counts_tool_calls():
+    call = lambda name: [{"role": "user", "content": "go"},
+                         {"role": "assistant", "content": "", "tool_calls": [{"name": name}]},
+                         {"role": "tool", "content": "ok", "tool_call_id": "1"},
+                         {"role": "assistant", "content": "done"}]
+    assert dedup_key(call("ls")) != dedup_key(call("rm"))
+
+
+def test_same_conversation_at_different_turns_is_not_a_duplicate(home, cli, write_json):
+    cli("nominate", "--file", write_json([{"messages": _convo(1)}, {"messages": _convo(3)}]))
+    store = Store(home)
+    ts = build_training_set(store, store.config())
+    assert len(ts["train"]) == 2 and ts["excluded"] == {}
+
+
+def test_dedup_uses_current_hash_not_the_stored_one(home, cli, write_json):
+    cli("nominate", "--file", write_json([{"messages": _convo(1)}, {"messages": _convo(3)}]))
+    store = Store(home)
+    # Simulate records written before the key included train markers.
+    records = [dict(e, dedup_key="stale") for e in store.experiences()]
+    store.experiences_path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    assert len(build_training_set(store, store.config())["train"]) == 2
+
+
 @pytest.mark.parametrize("payload, message", [
     ({"messages": []}, "non-empty list"),
     ({"messages": [{"role": "assistant", "content": "x"}]}, "user turn"),
@@ -192,3 +227,39 @@ def test_budget_follows_the_policy_order(home, cli, write_json):
     cli("policy", "set", "--file", write_json({"order_by": "recent"}))
     train, _ = _split(home)
     assert train == {new, mid}  # not the highest-priority ones
+
+
+@pytest.mark.parametrize("payload, message", [
+    ({"training_candidate": "not-an-object"}, "training_candidate must be an object"),
+    ({"source": ["x"]}, "source must be an object"),
+    ({"session_id": ["bad-session"]}, "session_id must be a non-empty string"),
+    ({"source": {"note": {"nested": 1}}}, "source.note"),
+    ({"experience_id": "../escape"}, "experience_id"),
+    ({"experience_id": 7}, "experience_id"),
+    ({"verification": "yes"}, "verification must be an object"),
+])
+def test_malformed_metadata_is_refused(payload, message):
+    base = experience("a")
+    base.pop("session_id")
+    with pytest.raises(ValidationError, match=message):
+        build_experience({**base, **payload})
+
+
+@pytest.mark.parametrize("payload", [
+    {"url": "https://example.com/?key=sk-" + "a" * 30},
+    {"tags": ["sk-" + "b" * 30]},
+    {"verification": {"status": "verified", "note": "password: hunter22"}},
+    {"selection": {"decision": "nominate", "reason": "token ghp_" + "c" * 36}},
+])
+def test_secrets_in_metadata_are_refused(payload):
+    with pytest.raises(ValidationError, match="secret"):
+        build_experience({**experience("a"), **payload})
+
+
+def test_effective_heldout_fraction_reflects_whole_sessions(home, cli, write_json):
+    cli("add", "--file", write_json([experience(f"e{i}", session=f"s{i % 2}") for i in range(4)]))
+    cli("policy", "set", "--mode", "all")
+    store = Store(home)
+    counts = build_training_set(store, store.config())["counts"]
+    assert counts["heldout_fraction_target"] == 0.15
+    assert counts["heldout_fraction_effective"] == 0.5  # one of two sessions

@@ -142,12 +142,14 @@ Kept tool results are cut to `--max-tool-chars` (default 2000).
 afterlife preview                      # what would be trained right now, and what is excluded and why
 afterlife methods                      # training methods, their defaults, and what you may tune
 afterlife train --request --method asft [--set learning_rate=1e-4 --set epochs=3] [--note "..."]
-afterlife status                       # is it done yet?
+afterlife status                       # is it done yet? (shows why a request is waiting)
+afterlife retry <request-id>           # queue a failed or interrupted request again, same selection
 ```
 
 Each run trains a **fresh** adapter from the base model on the current
 selection. So whatever is selected at request time is what that adapter
-learns. Earlier runs are not stacked on top.
+learns, minus anything the operator's rules no longer allow when it runs.
+Earlier runs are not stacked on top.
 
 **How much each memory is trained.** Each training step covers 8 rows, and a
 row is one target turn. With a fixed `max_steps`, a small selection is seen
@@ -180,7 +182,7 @@ request outside them is refused with the reason.
 afterlife eval --run latest            # loss per trained memory and on held-out data, vs base and current adapter
 afterlife eval --run latest --probes   # side-by-side answers from base / current / updated
 afterlife activate --run <run-id>      # use it from the next session on
-afterlife rollback                     # undo the last switch; repeat to keep going back (or --to base)
+afterlife rollback                     # undo the last switch, even a --to base; repeat to keep going back
 ```
 
 Each eval answers two kinds of prompt with each variant:
@@ -213,3 +215,8 @@ variant, so you can see whether the next you responds differently.
   `trained` (in a finished run that isn't active), `eval-only`, or a
   decision you made. Being selected doesn't guarantee being trained. Duplicates, over-long records and the per-run budget
   can still leave an experience out, and `preview` shows which ones and why.
+- When more is selected than the operator's per-run budget allows, your
+  nominations go first (highest priority first, newest first on ties), then
+  policy picks in the policy's own order. What doesn't fit is left out of that
+  run, and `train --request` warns you before queuing. To make room, nominate
+  fewer, or give your policy a `limit`.

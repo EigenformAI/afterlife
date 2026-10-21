@@ -197,9 +197,15 @@ def policy_hash(policy: dict[str, Any]) -> str:
     return sha256_json(policy)[:12]
 
 
+def _age(e: dict[str, Any]) -> tuple[str, int]:
+    """Sort key, oldest first. created_ns breaks same-second ties; records from
+    before it existed tie at 0 and keep their stored order."""
+    return e["created_at"], e.get("created_ns", 0)
+
+
 def _context(experiences: list[dict[str, Any]]) -> Context:
     sessions: list[str] = []
-    for e in sorted(experiences, key=lambda e: e["created_at"], reverse=True):
+    for e in sorted(experiences, key=_age, reverse=True):
         sid = e["source"].get("session_id")
         if sid and sid not in sessions:
             sessions.append(sid)
@@ -215,12 +221,12 @@ def order_experiences(
 ) -> list[dict[str, Any]]:
     if order_by == "priority":
         # Highest priority first; unscored last; newest first within ties.
-        newest = sorted(experiences, key=lambda e: e["created_at"], reverse=True)
+        newest = sorted(experiences, key=_age, reverse=True)
         return sorted(newest, key=lambda e: -(e["priority"] if e.get("priority") is not None else -1))
     if order_by == "recent":
-        return sorted(experiences, key=lambda e: e["created_at"], reverse=True)
+        return sorted(experiences, key=_age, reverse=True)
     if order_by == "oldest":
-        return sorted(experiences, key=lambda e: e["created_at"])
+        return sorted(experiences, key=_age)
     if order_by == "random":
         def key(e: dict[str, Any]) -> str:
             return hashlib.sha256(f"{seed}:{e['experience_id']}".encode()).hexdigest()

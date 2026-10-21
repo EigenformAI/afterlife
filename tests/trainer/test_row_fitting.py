@@ -101,3 +101,12 @@ def test_tool_definitions_reach_the_chat_template():
     _fit_sft_row(Recording(), prompt=None, raw_response="final", context=_convo(1),
                  max_seq_length=1000, stats={}, tools=tools)
     assert seen and all(t == tools for t in seen)
+
+
+def test_the_fitted_context_is_what_was_trained_on():
+    fitted = []
+    row = _fit_sft_row(ChatTokenizer(), prompt=None, raw_response="final", context=_convo(6),
+                       max_seq_length=200, stats={}, fitted_context=fitted)
+    text = "".join(chr(t) for t in row["input_ids"])
+    rendered = ChatTokenizer().apply_chat_template(fitted + [{"role": "assistant", "content": "final"}])
+    assert rendered == text and fitted[0]["role"] == "system" and len(fitted) < 14

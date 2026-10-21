@@ -72,14 +72,18 @@ def _completion_nll_rows(
     """(mean NLL, completion tokens) per row; None where nothing was scored."""
     import torch
 
-    from afterlife.trainer.qlora import _build_completion_only_labels, _build_query_response_sft_row
+    from afterlife.trainer.qlora import _build_completion_only_labels, _fit_sft_row
 
     out_rows: list[tuple[float, int] | None] = []
     for row in rows[:max_rows]:
-        enc = _build_query_response_sft_row(tokenizer, raw_response=row["raw_response"], context=_context(row),
-                                            tools=row.get("tools"))
-        ids = enc["input_ids"][:max_seq_length]
-        labels = _build_completion_only_labels(input_ids=ids, completion_mask=enc["completion_mask"][:max_seq_length])
+        # Fitted exactly as in training: old turns trimmed, the answer kept whole.
+        enc = _fit_sft_row(tokenizer, prompt=None, raw_response=row["raw_response"], context=_context(row),
+                           max_seq_length=max_seq_length, stats={}, tools=row.get("tools"))
+        if enc is None:
+            out_rows.append(None)
+            continue
+        ids = enc["input_ids"]
+        labels = _build_completion_only_labels(input_ids=ids, completion_mask=enc["completion_mask"])
         n = sum(1 for l in labels[1:] if l != -100)
         if n == 0:
             out_rows.append(None)
@@ -200,12 +204,19 @@ def evaluate_run(run_dir: Path) -> dict[str, Any]:
     heldout_rows = _read_jsonl(run_dir / "heldout.jsonl")
     probes = load_probes(store_root)
     # One training turn per experience first, so the sample covers as many memories as possible.
+    # Each is asked with the context it was trained on (oldest turns trimmed to fit the window);
+    # rows too long to train on are skipped here too.
+    from afterlife.trainer.qlora import _fit_sft_row
+
     recall_rows: list[dict[str, Any]] = []
     for row in train_rows:
         if len(recall_rows) < eval_cfg.recall_rows and row.get("experience_id") not in {
             r.get("experience_id") for r in recall_rows
         }:
-            recall_rows.append(row)
+            fitted: list[dict[str, Any]] = []
+            if _fit_sft_row(tokenizer, prompt=None, raw_response=row["raw_response"], context=_context(row),
+                            max_seq_length=max_seq, stats={}, tools=row.get("tools"), fitted_context=fitted):
+                recall_rows.append({**row, "messages": fitted})
 
     losses: dict[str, dict[str, float | None]] = {}
     train_scored: dict[str, list[tuple[float, int] | None]] = {}

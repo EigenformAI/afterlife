@@ -845,11 +845,13 @@ def _fit_sft_row(
     max_seq_length: int | None,
     stats: dict[str, int],
     tools: Sequence[dict[str, Any]] | None = None,
+    fitted_context: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Build one masked row that fits the window, or None (counted in ``stats``).
 
     Too-long rows lose their oldest turns, not their answer. A row that cannot
-    be masked at all is skipped rather than failing the whole run.
+    be masked at all is skipped rather than failing the whole run. Pass a list
+    as ``fitted_context`` to get the (possibly trimmed) context that was used.
     """
     context = list(context) if context is not None else None
     trimmed = False
@@ -869,6 +871,8 @@ def _fit_sft_row(
                 stats["mask_fallback"] = stats.get("mask_fallback", 0) + 1
             if trimmed:
                 stats["context_trimmed"] = stats.get("context_trimmed", 0) + 1
+            if fitted_context is not None and context is not None:
+                fitted_context[:] = context
             return row
         if context is None or not _drop_oldest_turn(context):
             stats["too_long"] = stats.get("too_long", 0) + 1

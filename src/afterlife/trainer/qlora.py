@@ -970,8 +970,10 @@ def _load_rehearsal_sft_rows(
         epoch_rows: list[dict[str, Any]] = []
         for text in selected_texts:
             # Afterlife: the target is what follows the excerpt, not the whole
-            # passage, so "continue" is the task actually trained.
-            excerpt = text[:prompt_chars].rstrip()
+            # passage, so "continue" is the task actually trained. The excerpt
+            # is at most half the passage, so short passages still leave a
+            # continuation to learn.
+            excerpt = text[: min(prompt_chars, len(text) // 2)].rstrip()
             continuation = text[len(excerpt):].strip()
             if not excerpt or not continuation:
                 continue

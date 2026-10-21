@@ -97,4 +97,6 @@ def test_same_second_ties_go_to_the_later_record():
 
 def test_random_order_depends_on_the_seed():
     pool = _pool(*POOL)
+    for i, e in enumerate(pool):
+        e["experience_id"] = f"exp-{i}"  # fixed ids: random ones make the two orders coincide 1 time in 24
     assert _select({"order_by": "random", "seed": 1}, pool)[0] != _select({"order_by": "random", "seed": 2}, pool)[0]

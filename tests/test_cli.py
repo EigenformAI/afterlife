@@ -442,7 +442,7 @@ def test_ctrl_c_mid_training_marks_the_request_interrupted(home, cli, write_json
     with pytest.raises(KeyboardInterrupt):
         worker.run_pending(Store(home))
     request = Store(home).requests()[0]
-    assert request["status"] == "interrupted"
+    assert request["status"] == "interrupted" and request["error"] == "worker interrupted (Ctrl-C)"
     assert Store(home).resolve_run(request["run_id"])["status"] == "interrupted"
 
 

@@ -189,6 +189,14 @@ def _ended(exc: BaseException) -> str:
     return "interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed"
 
 
+def _describe(exc: BaseException) -> str:
+    if isinstance(exc, KeyboardInterrupt):
+        return "worker interrupted (Ctrl-C)"
+    if isinstance(exc, SystemExit):
+        return f"worker stopped by a signal (exit {exc.code})"
+    return str(exc) or type(exc).__name__
+
+
 def recover_interrupted(store: Store) -> list[dict[str, Any]]:
     """Mark work left mid-flight by a worker that died as interrupted. Call with the worker lock held.
 
@@ -231,7 +239,7 @@ def process_request(store: Store, request: dict[str, Any], *, dry_run: bool = Fa
     try:
         run_dir = prepare_run(store, config, request)
     except BaseException as exc:
-        _set_request(store, request, _ended(exc), error=str(exc) or type(exc).__name__)
+        _set_request(store, request, _ended(exc), error=_describe(exc))
         raise
     run_id = run_dir.name
     _set_request(store, request, "running", run_id=run_id)
@@ -259,7 +267,7 @@ def process_request(store: Store, request: dict[str, Any], *, dry_run: bool = Fa
                          for step in ("train", "eval")},
         )
     except BaseException as exc:
-        error = str(exc) or type(exc).__name__
+        error = _describe(exc)
         _update_manifest(store, run_dir, status=_ended(exc), error=error)
         _set_request(store, request, _ended(exc), error=error)
         raise

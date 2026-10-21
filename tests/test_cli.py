@@ -488,3 +488,63 @@ def test_train_request_warns_when_the_budget_cuts(home, cli, write_json):
     cfg.write_text(cfg.read_text().replace("max_examples_per_run = 2", "max_examples_per_run = 500"))
     out = cli("train", "--request", "--method", "sft")[1]
     assert "over_budget" not in out and "warning" not in out
+
+
+def test_a_corrupt_store_file_still_gives_a_json_error(home, cli, write_json):
+    cli("add", "--file", write_json(experience("a")))
+    with open(home / "experiences.jsonl", "a") as f:
+        f.write("{not json\n")
+    code, out = cli("list")
+    assert code == 1 and not out["ok"] and "corrupt JSONL line" in out["error"]
+
+
+def test_a_reject_after_queuing_keeps_the_experience_out(home, cli, write_json):
+    _, out = cli("nominate", "--file", write_json([experience("a"), experience("b", session="s2")]))
+    a, b = out["nominated"]
+    cli("train", "--request", "--method", "sft")
+    cli("reject", "--id", a, "--reason", "has someone's address in it")
+    manifest = cli("worker", "--dry-run")[1]["processed"][0]["manifest"]
+    selection = json.loads((home / "runs" / manifest["run_id"] / "selection.json").read_text())
+    assert selection["train_ids"] == [b]
+    assert selection["excluded"][a] == "reject decided after the request was queued"
+
+
+def test_queued_requests_are_capped(home, cli, write_json):
+    cli("nominate", "--file", write_json(experience("a")))
+    for _ in range(3):
+        assert cli("train", "--request", "--method", "sft")[0] == 0
+    code, out = cli("train", "--request", "--method", "sft")
+    assert code == 3 and len(out["pending"]) == 3
+
+
+def test_served_model_name_is_afterlife_with_or_without_an_adapter(home, cli):
+    import shlex
+
+    config = Store(home).config()
+    out = cli("serve-cmd")[1]
+    assert out["model_name"] == "afterlife"
+    assert out["command"][-3:] == ["--served-model-name", "afterlife", config.serve_model]
+    _fake_ready_run(home, "run-a", "2026-01-01T00:00:00Z", base_model=config.base_model)
+    (home / "runs" / "run-a" / "adapter" / "adapter_config.json").write_text('{"r": 100}')
+    cli("activate", "--run", "run-a")
+    out = cli("serve-cmd")[1]
+    assert out["model_name"] == "afterlife" and "--served-model-name" not in out["command"]
+    assert shlex.split(out["shell"])[out["command"].index("--max-lora-rank") + 1] == "128"
+
+
+def test_worker_loop_reports_each_result_as_it_happens(home, cli, write_json, monkeypatch):
+    from afterlife import worker
+
+    cli("nominate", "--file", write_json(experience("a")))
+    cli("train", "--request", "--method", "sft")
+    seen = []
+
+    def stop_after_first_poll(_seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(worker.time, "sleep", stop_after_first_poll)
+    try:
+        worker.run_pending(Store(home), once=False, dry_run=True, on_result=seen.append)
+    except KeyboardInterrupt:
+        pass
+    assert [r["ok"] for r in seen] == [True]

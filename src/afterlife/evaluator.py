@@ -76,7 +76,8 @@ def _completion_nll_rows(
 
     out_rows: list[tuple[float, int] | None] = []
     for row in rows[:max_rows]:
-        enc = _build_query_response_sft_row(tokenizer, raw_response=row["raw_response"], context=_context(row))
+        enc = _build_query_response_sft_row(tokenizer, raw_response=row["raw_response"], context=_context(row),
+                                            tools=row.get("tools"))
         ids = enc["input_ids"][:max_seq_length]
         labels = _build_completion_only_labels(input_ids=ids, completion_mask=enc["completion_mask"][:max_seq_length])
         n = sum(1 for l in labels[1:] if l != -100)
@@ -129,7 +130,9 @@ def split_thinking(text: str) -> dict[str, str | None]:
     return {"thinking": None, "answer": text.strip()}
 
 
-def _generate(model: Any, tokenizer: Any, conversations: list[list[dict[str, str]]], max_new_tokens: int) -> list[str]:
+def _generate(model: Any, tokenizer: Any, conversations: list[tuple[list[dict[str, Any]], list | None]],
+              max_new_tokens: int) -> list[str]:
+    """Greedy answers to (messages, tool definitions) pairs."""
     import torch
 
     text_tok = getattr(tokenizer, "tokenizer", tokenizer)
@@ -140,8 +143,8 @@ def _generate(model: Any, tokenizer: Any, conversations: list[list[dict[str, str
     outputs: list[str] = []
     for i in range(0, len(conversations), PROBE_BATCH_SIZE):
         batch = [
-            tokenizer.apply_chat_template(c, tokenize=False, add_generation_prompt=True)
-            for c in conversations[i : i + PROBE_BATCH_SIZE]
+            tokenizer.apply_chat_template(c, tokenize=False, add_generation_prompt=True, **({"tools": t} if t else {}))
+            for c, t in conversations[i : i + PROBE_BATCH_SIZE]
         ]
         inputs = text_tok(batch, return_tensors="pt", padding=True, add_special_tokens=False).to(device)
         with torch.no_grad():
@@ -216,8 +219,8 @@ def evaluate_run(run_dir: Path) -> dict[str, Any]:
                 "heldout": _mean(_completion_nll_rows(model, tokenizer, heldout_rows, max_seq, n_loss)),
                 "train": _mean(train_scored[name]),
             }
-            conversations = [[{"role": "user", "content": p["prompt"]}] for p in probes]
-            conversations += [_context(r) for r in recall_rows]
+            conversations = [([{"role": "user", "content": p["prompt"]}], None) for p in probes]
+            conversations += [(_context(r), r.get("tools")) for r in recall_rows]
             texts = _generate(model, tokenizer, conversations, eval_cfg.probe_max_new_tokens)
             for slot, text in zip(answers, texts):
                 slot[name] = split_thinking(text)
@@ -248,9 +251,13 @@ def evaluate_run(run_dir: Path) -> dict[str, Any]:
             for name in variants
         },
         "probe_max_new_tokens": eval_cfg.probe_max_new_tokens,
+        "evaluated_on": manifest["base_model"],
+        "served_on": manifest.get("serve_model"),
         "note": "Negative loss change = updated adapter predicts those memories better. Lower loss "
         "does not always mean recall: compare the recall answers with their targets, and read the "
-        "probe answers for regressions, before activating.",
+        "probe answers for regressions, before activating. Answers come from the training "
+        "checkpoint (evaluated_on); the served model (served_on) can answer borderline prompts "
+        "differently.",
     }
     report = {
         "run_id": manifest["run_id"],

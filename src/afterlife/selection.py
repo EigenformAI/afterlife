@@ -120,7 +120,7 @@ def build_training_set(store: Store, config: Config, split_seed: str = "") -> di
         messages = e["training_candidate"]["messages"]
         if (problem := admission_problem(e, op)) is not None:
             excluded[eid] = problem
-        elif (key := dedup_key(messages)) in seen:  # recomputed: stored keys may predate the current hash
+        elif (key := dedup_key(messages, e["training_candidate"].get("tools"))) in seen:  # recomputed: stored keys may predate the current hash
             excluded[eid] = f"duplicate of {seen[key]}"
         else:
             seen[key] = eid
@@ -190,5 +190,7 @@ def to_trainer_rows(experience: dict[str, Any]) -> list[dict[str, Any]]:
                "experience_id": experience["experience_id"], "turn": i}
         if len(context) == 1 and context[0]["role"] == "user":
             row["prompt"] = context[0]["content"]
+        if experience["training_candidate"].get("tools"):
+            row["tools"] = experience["training_candidate"]["tools"]
         rows.append(row)
     return rows

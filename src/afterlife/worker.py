@@ -23,7 +23,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from afterlife.config import Config
 from afterlife.recipes import resolve_recipe, rows_per_pass, train_sft_kwargs
@@ -70,8 +70,9 @@ def _frozen_training_set(store: Store, config: Config, request: dict[str, Any]) 
     """Rebuild the training set the agent saw at request time, under the operator's current rules.
 
     Membership is fixed at request time: nothing is added from later store
-    contents. A member the current rules no longer allow, or whose content no
-    longer matches what was requested, is dropped with the reason, not replaced.
+    contents. A member the current rules no longer allow, whose content no
+    longer matches what was requested, or that the agent has since rejected,
+    deferred or kept as notes only, is dropped with the reason, not replaced.
     """
     frozen = request.get("frozen_selection")
     if not frozen:
@@ -80,6 +81,9 @@ def _frozen_training_set(store: Store, config: Config, request: dict[str, Any]) 
     by_id = {e["experience_id"]: e for e in store.experiences()}
     hashes = frozen.get("content_hashes", {})  # absent on requests queued by older versions
     excluded = dict(frozen["excluded"])
+    # Decisions made since queuing that say "don't train this" (e.g. personal data noticed late).
+    withdrawn = {i: d["decision"] for i, d in store.latest_decisions().items()
+                 if d["decision"] != "nominate" and d["created_at"] >= request["created_at"]}
 
     def admit(ids: list[str]) -> list[dict[str, Any]]:
         kept = []
@@ -87,6 +91,8 @@ def _frozen_training_set(store: Store, config: Config, request: dict[str, Any]) 
             e = by_id.get(i)
             if e is None:
                 excluded[i] = "no longer in the store"
+            elif i in withdrawn:
+                excluded[i] = f"{withdrawn[i]} decided after the request was queued"
             elif i in hashes and content_hash(e) != hashes[i]:
                 excluded[i] = "content changed since the request was queued"
             elif (problem := admission_problem(e, op)) is not None:
@@ -172,14 +178,19 @@ def _update_manifest(store: Store, run_dir: Path, **fields: Any) -> dict[str, An
     return manifest
 
 
-def _child(step: str, run_dir: Path, lock_fd: int | None = None) -> None:
+def _child(step: str, run_dir: Path, lock_fd: int | None = None, timeout_minutes: float = 0) -> None:
     # The child inherits the worker lock (flock follows the open file), so if
     # the worker dies mid-run, no new worker can start until the child is done
     # with the GPU. On an exception here (Ctrl-C included) subprocess.run kills it.
     cmd = [sys.executable, "-m", "afterlife.worker", step, str(run_dir)]
     with open(run_dir / f"{step}.log", "a", encoding="utf-8") as log:
-        proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT,
-                              pass_fds=(lock_fd,) if lock_fd is not None else ())
+        try:
+            proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT,
+                                  pass_fds=(lock_fd,) if lock_fd is not None else (),
+                                  timeout=timeout_minutes * 60 or None)
+        except subprocess.TimeoutExpired as exc:  # run() has already killed the child
+            raise WorkerError(f"{step} ran longer than {timeout_minutes:g} min "
+                              "([operator].max_run_minutes) and was stopped") from exc
     if proc.returncode != 0:
         raise WorkerError(f"{step} failed (exit {proc.returncode}); see {run_dir / f'{step}.log'}")
 
@@ -252,13 +263,15 @@ def process_request(store: Store, request: dict[str, Any], *, dry_run: bool = Fa
     started = time.time()
     try:
         _update_manifest(store, run_dir, status="training")
-        _child("train", run_dir, lock_fd)
+        _child("train", run_dir, lock_fd, config.operator.max_run_minutes)
         _update_manifest(
             store, run_dir, status="evaluating", adapter_path=str(run_dir / "adapter"),
             train_seconds=round(time.time() - started, 1),
+            # kept / too_long / context_trimmed / unmaskable / mask_fallback rows
+            row_stats=(store.read_json(run_dir / "adapter" / "training_info.json") or {}).get("row_stats"),
         )
         started = time.time()
-        _child("eval", run_dir, lock_fd)
+        _child("eval", run_dir, lock_fd, config.operator.max_run_minutes)
         eval_report = store.read_json(run_dir / "eval.json")
         manifest = _update_manifest(
             store, run_dir, status="ready", eval=eval_report.get("summary"),
@@ -294,9 +307,22 @@ def _process_pending(store: Store, waiting: set[str], *, dry_run: bool = False,
     return results
 
 
-def run_pending(store: Store, *, once: bool = True, dry_run: bool = False, poll_seconds: int = 30) -> list[dict[str, Any]]:
-    """Process pending requests oldest first. One worker at a time per store."""
-    results = []
+def run_pending(store: Store, *, once: bool = True, dry_run: bool = False, poll_seconds: int = 30,
+                on_result: Callable[[dict[str, Any]], None] | None = None) -> list[dict[str, Any]]:
+    """Process pending requests oldest first. One worker at a time per store.
+
+    With ``on_result``, each result is handed over as it happens instead of
+    being collected, so a long-running loop reports progress and doesn't grow.
+    """
+    results: list[dict[str, Any]] = []
+
+    def report(batch: list[dict[str, Any]]) -> None:
+        if on_result is None:
+            results.extend(batch)
+        else:
+            for result in batch:
+                on_result(result)
+
     waiting: set[str] = set()
     with open(store.root / ".worker.lock", "a+") as lock:
         try:
@@ -306,9 +332,9 @@ def run_pending(store: Store, *, once: bool = True, dry_run: bool = False, poll_
         # SIGTERM (e.g. a pod shutting down) unwinds like Ctrl-C, so the run is marked interrupted.
         previous = signal.signal(signal.SIGTERM, _raise_exit)
         try:
-            results += recover_interrupted(store)
+            report(recover_interrupted(store))
             while True:
-                results += _process_pending(store, waiting, dry_run=dry_run, lock_fd=lock.fileno())
+                report(_process_pending(store, waiting, dry_run=dry_run, lock_fd=lock.fileno()))
                 if once:
                     return results
                 time.sleep(poll_seconds)

@@ -542,6 +542,7 @@ def _build_query_response_sft_row(
     prompt: str | None = None,
     raw_response: str,
     context: Sequence[dict[str, Any]] | None = None,
+    tools: Sequence[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     # Afterlife: render the conversation with the model's own chat template, so
     # multi-turn context looks exactly as it will at inference. Put the loss on
@@ -553,12 +554,19 @@ def _build_query_response_sft_row(
     # thinking models from learning "skip thinking" from answer-only examples.
     # Falls back to the NSL2 boundary below when the response text cannot be
     # located on a token boundary in the rendered conversation.
-    row = _answer_only_sft_row(tokenizer, prompt=prompt, raw_response=raw_response, context=context)
+    row = _answer_only_sft_row(tokenizer, prompt=prompt, raw_response=raw_response, context=context, tools=tools)
     if row is not None:
         return row
     return _build_query_response_sft_row_nsl(
-        tokenizer, prompt=prompt, raw_response=raw_response, context=context
+        tokenizer, prompt=prompt, raw_response=raw_response, context=context, tools=tools
     )
+
+
+def _template_kwargs(tools: Sequence[dict[str, Any]] | None) -> dict[str, Any]:
+    # Afterlife: tool definitions go to the template, which renders them into the
+    # prompt as it does at inference. Only passed when present, since not every
+    # template accepts the argument.
+    return {"tools": list(tools)} if tools else {}
 
 
 def _answer_only_sft_row(
@@ -567,6 +575,7 @@ def _answer_only_sft_row(
     prompt: str | None = None,
     raw_response: str,
     context: Sequence[dict[str, Any]] | None = None,
+    tools: Sequence[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """The answer-only masked row, or None when the response can't be located on a token boundary."""
     messages = _context_messages(prompt, context)
@@ -574,6 +583,7 @@ def _answer_only_sft_row(
         messages + [{"role": "assistant", "content": raw_response}],
         tokenize=False,
         add_generation_prompt=False,
+        **_template_kwargs(tools),
     )
     start = full_text.rfind(raw_response) if raw_response else -1
     if start > 0:
@@ -602,6 +612,7 @@ def _build_query_response_sft_row_nsl(
     prompt: str | None = None,
     raw_response: str,
     context: Sequence[dict[str, Any]] | None = None,
+    tools: Sequence[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     # Render the masked-prompt boundary WITHOUT the generation prompt. Gemma 4's
     # chat template, with add_generation_prompt=True, appends a "thinking channel"
@@ -618,11 +629,13 @@ def _build_query_response_sft_row_nsl(
         messages,
         tokenize=False,
         add_generation_prompt=False,
+        **_template_kwargs(tools),
     )
     full_text = tokenizer.apply_chat_template(
         messages + [{"role": "assistant", "content": raw_response}],
         tokenize=False,
         add_generation_prompt=False,
+        **_template_kwargs(tools),
     )
 
     prompt_ids = _tokenize_text(tokenizer, prompt_text)
@@ -797,15 +810,81 @@ def _is_message_list(value: Any) -> bool:
     )
 
 
+def _completion_fits(row: dict[str, Any], max_seq_length: int | None) -> bool:
+    # Afterlife: the whole completion (answer and end-of-turn marker) must fit.
+    # The collator keeps the first max_seq_length tokens, so a row whose answer
+    # runs past the window would teach an answer that never stops.
+    if max_seq_length is None:
+        return True
+    mask = _as_1d_int_list(row["completion_mask"], key="completion_mask")
+    last = max((i for i, m in enumerate(mask) if m), default=-1)
+    return 0 <= last < max_seq_length
+
+
+def _drop_oldest_turn(context: list[dict[str, Any]]) -> bool:
+    """Drop the oldest exchange, keeping leading system messages and starting on a user turn."""
+    n_system = next((i for i, m in enumerate(context) if m.get("role") != "system"), len(context))
+    rest = context[n_system:]
+    if len(rest) <= 1:
+        return False
+    rest = rest[1:]
+    while rest and rest[0].get("role") != "user":
+        rest = rest[1:]
+    if not rest:
+        return False
+    context[n_system:] = rest
+    return True
+
+
+def _fit_sft_row(
+    tokenizer: Any,
+    *,
+    prompt: str | None,
+    raw_response: str,
+    context: Sequence[dict[str, Any]] | None,
+    max_seq_length: int | None,
+    stats: dict[str, int],
+    tools: Sequence[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Build one masked row that fits the window, or None (counted in ``stats``).
+
+    Too-long rows lose their oldest turns, not their answer. A row that cannot
+    be masked at all is skipped rather than failing the whole run.
+    """
+    context = list(context) if context is not None else None
+    trimmed = False
+    while True:
+        row = _answer_only_sft_row(tokenizer, prompt=prompt, raw_response=raw_response, context=context, tools=tools)
+        fallback = row is None
+        if fallback:
+            try:
+                row = _build_query_response_sft_row_nsl(
+                    tokenizer, prompt=prompt, raw_response=raw_response, context=context, tools=tools
+                )
+            except ValueError:
+                stats["unmaskable"] = stats.get("unmaskable", 0) + 1
+                return None
+        if _completion_fits(row, max_seq_length):
+            if fallback:
+                stats["mask_fallback"] = stats.get("mask_fallback", 0) + 1
+            if trimmed:
+                stats["context_trimmed"] = stats.get("context_trimmed", 0) + 1
+            return row
+        if context is None or not _drop_oldest_turn(context):
+            stats["too_long"] = stats.get("too_long", 0) + 1
+            return None
+        trimmed = True
+
+
 def _load_self_generated_sft_rows(
     training_data_paths: Sequence[Path],
     tokenizer: Any,
     *,
     max_seq_length: int | None = None,
+    row_stats: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    dropped_fully_truncated = 0
-    mask_fallbacks = 0
+    stats = row_stats if row_stats is not None else {}
     for training_data_path in training_data_paths:
         resolved_path = Path(training_data_path).expanduser().resolve()
         with open(resolved_path, "r", encoding="utf-8") as handle:
@@ -832,42 +911,47 @@ def _load_self_generated_sft_rows(
 
                 # Keep one full-conversation encoding to avoid the Gemma 4
                 # prompt/completion concat crash, but attach an explicit mask so
-                # only response tokens contribute to the loss.
-                row = _answer_only_sft_row(
-                    tokenizer, prompt=prompt, raw_response=raw_response, context=context
+                # only response tokens contribute to the loss. Rows that can't
+                # fit or be masked are dropped and counted: a zero-label row
+                # alone in a batch divides the loss by zero and poisons
+                # gradient accumulation with nan.
+                tools = payload.get("tools")  # Afterlife: tool definitions shown to the model
+                row = _fit_sft_row(
+                    tokenizer, prompt=prompt, raw_response=raw_response, context=context,
+                    max_seq_length=max_seq_length, stats=stats,
+                    tools=tools if isinstance(tools, list) else None,
                 )
-                if row is None:  # Afterlife: count it, the fallback also trains on scaffold tokens
-                    mask_fallbacks += 1
-                    row = _build_query_response_sft_row_nsl(
-                        tokenizer, prompt=prompt, raw_response=raw_response, context=context
-                    )
-                # Drop rows whose prompt alone fills the sequence window: after the
-                # collator truncates to the first max_seq_length tokens, no response
-                # token survives, so every label is IGNORE_INDEX. Such a row carries
-                # zero training signal and, alone in a batch (bs=1), divides the loss
-                # by zero valid tokens -> nan that poisons gradient accumulation.
-                if not _completion_survives_truncation(
-                    row,
-                    max_seq_length=max_seq_length,
-                ):
-                    dropped_fully_truncated += 1
-                    continue
-                rows.append(row)
+                if row is not None:
+                    rows.append(row)
 
-    if dropped_fully_truncated:
+    stats["kept"] = len(rows)
+    if stats.get("too_long"):
         logger.warning(
-            "Dropped {} self-generated SFT row(s) whose response is fully truncated "
-            "at max_seq_length={} (prompt alone fills the window); kept {}.",
-            dropped_fully_truncated,
+            "Dropped {} row(s) whose answer doesn't fit max_seq_length={} even with "
+            "older turns removed; kept {}.",
+            stats["too_long"],
             max_seq_length,
             len(rows),
         )
-    if mask_fallbacks:
+    if stats.get("context_trimmed"):
+        logger.warning(
+            "{} row(s) were longer than max_seq_length={}; their oldest turns were "
+            "dropped so the answer fits.",
+            stats["context_trimmed"],
+            max_seq_length,
+        )
+    if stats.get("unmaskable"):
+        logger.warning(
+            "Skipped {} row(s) whose prompt is not a token prefix of the full "
+            "conversation under this chat template.",
+            stats["unmaskable"],
+        )
+    if stats.get("mask_fallback"):
         logger.warning(
             "{} row(s) could not be masked to the answer alone (response text not on a "
             "token boundary in the rendered template); their loss also covers the "
             "assistant-turn scaffold, e.g. an empty <think></think> block.",
-            mask_fallbacks,
+            stats["mask_fallback"],
         )
     return rows
 
@@ -1017,6 +1101,7 @@ def _load_sft_dataset(
     rehearsal_prompt: str = "Continue the following passage",
     rehearsal_prompt_chars: int = 256,
     rehearsal_max_chars: int = 2048,
+    row_stats: dict[str, int] | None = None,
 ) -> Any:
     """Load generation JSONL files plus optional rehearsal rows into an SFT Dataset."""
 
@@ -1024,7 +1109,7 @@ def _load_sft_dataset(
         raise ValueError("virtual_epochs must be at least 1")
 
     rows = _load_self_generated_sft_rows(
-        training_data_paths, tokenizer, max_seq_length=max_seq_length
+        training_data_paths, tokenizer, max_seq_length=max_seq_length, row_stats=row_stats
     )
 
     if not rows:
@@ -1232,9 +1317,11 @@ def train_sft(
     resolved_training_paths = [
         str(Path(path).expanduser().resolve()) for path in training_data_paths
     ]
+    row_stats: dict[str, int] = {}  # Afterlife: recorded in training_info.json
     dataset = _load_sft_dataset(
         [Path(path) for path in resolved_training_paths],
         tokenizer,
+        row_stats=row_stats,
         max_seq_length=max_seq_length,
         virtual_epochs=num_train_epochs,
         rehearsal_dataset=rehearsal_dataset,
@@ -1356,6 +1443,7 @@ def train_sft(
     )
     metadata: dict[str, Any] = {
         "base_model": base_model,
+        "row_stats": row_stats,
         "max_steps": max_steps,
         "configured_num_train_epochs": num_train_epochs,
         "virtual_epochs": num_train_epochs,

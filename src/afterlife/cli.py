@@ -18,7 +18,7 @@ from afterlife import __version__
 from afterlife.config import DEFAULT_BASE_MODEL, ConfigError, render_default_config
 from afterlife.policies import PolicyError, current_strategy, set_strategy, validate_policy
 from afterlife.recipes import (
-    RecipeError, describe_methods, parse_param, resolve_recipe, rows_per_pass,
+    METHODS, RecipeError, describe_methods, parse_param, resolve_recipe, rows_per_pass,
 )
 from afterlife.schemas import ValidationError, build_decision, build_experience, embedded_decision, find_secrets
 from afterlife.selection import build_training_set, content_hash, select
@@ -302,6 +302,11 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
         raise CliError("training runs on the operator's worker; use `afterlife train --request`", EXIT_INPUT)
     if not config.operator.training_enabled:
         raise CliError("training is disabled by the operator", EXIT_REFUSED)
+    pending = [r["request_id"] for r in store.requests() if r["status"] == "pending"]
+    if len(pending) >= config.operator.max_pending_requests:
+        raise CliError(f"{len(pending)} request(s) already waiting (operator limit "
+                       f"{config.operator.max_pending_requests}); wait for the worker", EXIT_REFUSED,
+                       pending=pending)
     request_id = new_id("req")
     ts = build_training_set(store, config, split_seed=request_id)
     if not ts["train"]:
@@ -312,7 +317,7 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
         recipe = resolve_recipe(config, args.method, overrides,
                                 train_rows=rows_per_pass(config, ts["counts"]["train_rows"]))
     except RecipeError as exc:
-        raise CliError(str(exc), EXIT_REFUSED if "operator" in str(exc) else EXIT_INPUT) from exc
+        raise CliError(str(exc), EXIT_REFUSED if exc.refused else EXIT_INPUT) from exc
     request = {
         "request_id": request_id, "created_at": utc_now(), "updated_at": utc_now(),
         "status": "pending", "method": args.method, "params": overrides, "note": args.note,
@@ -525,10 +530,27 @@ def cmd_serve_cmd(args: argparse.Namespace) -> dict[str, Any]:
         if mismatch:
             raise CliError(f"active run {active['run_id']} {mismatch}; `afterlife rollback --to base` "
                            "or activate a run trained for these models", EXIT_REFUSED)
-        cmd += ["--enable-lora", "--max-lora-rank", "64",
+        cmd += ["--enable-lora", "--max-lora-rank", str(_vllm_lora_rank(store.active_link)),
                 "--lora-modules", f"afterlife={store.active_link}"]
-    return {"command": cmd, "model_name": "afterlife" if active.get("run_id") else config.serve_model,
-            "shell": shlex.join(cmd)}
+    else:
+        # On base the model still answers to "afterlife", so the agent's model name never changes.
+        cmd += ["--served-model-name", "afterlife", config.serve_model]
+    return {"command": cmd, "model_name": "afterlife", "shell": shlex.join(cmd)}
+
+
+VLLM_LORA_RANKS = (8, 16, 32, 64, 128, 256, 320, 512)
+
+
+def _vllm_lora_rank(adapter: Path) -> int:
+    """The smallest --max-lora-rank vLLM accepts that fits the adapter's rank."""
+    try:
+        rank = int(json.loads((adapter / "adapter_config.json").read_text())["r"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return 64
+    for allowed in VLLM_LORA_RANKS:
+        if allowed >= rank:
+            return allowed
+    raise CliError(f"adapter rank {rank} is above what vLLM serves ({VLLM_LORA_RANKS[-1]})", EXIT_REFUSED)
 
 
 def cmd_check_model(args: argparse.Namespace) -> dict[str, Any]:
@@ -556,11 +578,24 @@ def cmd_worker(args: argparse.Namespace) -> dict[str, Any]:
     from afterlife.worker import WorkerError, run_pending
 
     store = _store(args)
+
+    def print_now(result: dict[str, Any]) -> None:  # --loop never returns, so report as we go
+        line = json.dumps(result, ensure_ascii=False) if args.json else _describe_result(result)
+        print(line, flush=True)
+
     try:
-        results = run_pending(store, once=not args.loop, dry_run=args.dry_run)
+        results = run_pending(store, once=not args.loop, dry_run=args.dry_run,
+                              on_result=print_now if args.loop else None)
     except WorkerError as exc:
         raise CliError(str(exc), EXIT_REFUSED) from exc
     return {"processed": results}
+
+
+def _describe_result(result: dict[str, Any]) -> str:
+    if result.get("ok"):
+        m = result["manifest"]
+        return f"{result['request_id']}: run {m['run_id']} {m['status']}"
+    return f"{result['request_id']}: {result.get('error')}"
 
 
 # -- human-readable rendering ----------------------------------------------------
@@ -669,7 +704,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = add("train", cmd_train, "request a training run (the operator's worker runs it)")
     sp.add_argument("--request", action="store_true")
-    sp.add_argument("--method", default="asft", choices=("sft", "dft", "asft"))
+    sp.add_argument("--method", default="asft", choices=tuple(METHODS))
     sp.add_argument("--set", action="append", metavar="KEY=VALUE", help="override a tunable parameter")
     sp.add_argument("--note")
 
@@ -716,6 +751,9 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         code = EXIT_ERROR
         payload = {"ok": False, "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001 - agents parse this output; never hand them a traceback
+        code = EXIT_ERROR
+        payload = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "unexpected": True}
     if args.json:
         print(json.dumps(payload, ensure_ascii=False))
     elif payload["ok"]:

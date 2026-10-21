@@ -32,10 +32,20 @@ SECRET_PATTERNS: dict[str, re.Pattern[str]] = {
     "private_key": re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     "aws_access_key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     "github_token": re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"),
+    "github_fine_grained_token": re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}"),
     "openai_style_key": re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+    "stripe_key": re.compile(r"\b[sr]k_(live|test)_[A-Za-z0-9]{16,}"),
+    "google_api_key": re.compile(r"\bAIza[0-9A-Za-z_-]{35}"),
+    "huggingface_token": re.compile(r"\bhf_[A-Za-z0-9]{30,}"),
     "slack_token": re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"),
+    "jwt": re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
     "bearer_token": re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{20,}"),
+    "url_with_password": re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s:/@]+:[^\s@/]+@[^\s/]+"),
     "password_assignment": re.compile(r"(?i)\b(password|passwd|pwd)\s*[:=]\s*\S{4,}"),
+    # key = value where the value looks like a credential, not code: 16+ token characters.
+    "secret_assignment": re.compile(
+        r"(?i)\b[a-z0-9_]*(api[_-]?key|secret|token|access[_-]?key|private[_-]?key)\b[\"']?\s*[:=]\s*[\"']?"
+        r"[A-Za-z0-9/+_=.-]{16,}"),
 }
 
 
@@ -102,11 +112,12 @@ def target_turns(messages: list[dict[str, Any]]) -> list[int]:
     return [len(messages) - 1] if messages and messages[-1].get("role") == "assistant" else []
 
 
-def dedup_key(messages: list[dict[str, Any]]) -> str:
+def dedup_key(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> str:
     """Hash of the conversation with case/whitespace/unicode-form normalised.
 
     Which turns are trained is part of the key: the same conversation learned
-    at a different turn is a different example. Tool-use fields count too.
+    at a different turn is a different example. Tool-use fields and tool
+    definitions count too.
     """
     targets = set(target_turns(messages))
     norm = [
@@ -118,7 +129,7 @@ def dedup_key(messages: list[dict[str, Any]]) -> str:
         }
         for i, m in enumerate(messages)
     ]
-    return sha256_json(norm)[:16]
+    return sha256_json([norm, tools] if tools else norm)[:16]
 
 
 def build_experience(payload: dict[str, Any]) -> dict[str, Any]:
@@ -162,6 +173,11 @@ def build_experience(payload: dict[str, Any]) -> dict[str, Any]:
 
     messages = candidate.get("messages", payload.get("messages"))
     problems = check_messages(messages)
+    # Tool definitions the model was shown (OpenAI-style schemas). The chat
+    # template renders them into the prompt, as it does at inference.
+    tools = candidate.get("tools", payload.get("tools"))
+    if tools is not None and not (isinstance(tools, list) and tools and all(isinstance(t, dict) for t in tools)):
+        problems.append("tools must be a non-empty list of objects")
     if problems:
         raise ValidationError(problems)
 
@@ -204,9 +220,10 @@ def build_experience(payload: dict[str, Any]) -> dict[str, Any]:
         "tags": sorted(set(tags)),
         "priority": priority,
         "eval_only": eval_only,
-        "training_candidate": {"messages": messages, "verification": verification},
-        "dedup_key": dedup_key(messages),
-        "chars": len(messages_text(messages)),
+        "training_candidate": {"messages": messages, "verification": verification,
+                               **({"tools": tools} if tools else {})},
+        "dedup_key": dedup_key(messages, tools),
+        "chars": len(messages_text(messages)) + (len(json.dumps(tools, ensure_ascii=False)) if tools else 0),
     }
     # Messages were scanned above with a clearer message; this covers everything
     # else that is persisted: source, tags, verification notes, ids, the reason.

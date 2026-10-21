@@ -10,6 +10,6 @@ def _missing(*modules: str) -> bool:
 # test_training_artifacts.py is stdlib-only, so it always runs.
 collect_ignore = ["test_qlora.py", "test_asft.py", "test_dft_fused.py"] if _missing("torch", "loguru", "dotenv") else []
 if _missing("loguru", "dotenv"):  # check-model reuses the trainer's masking, which needs these but not torch
-    collect_ignore.append("test_modelcheck.py")
+    collect_ignore += ["test_modelcheck.py", "test_row_fitting.py"]
 if _missing("unsloth"):
     collect_ignore.append("test_asft.py")

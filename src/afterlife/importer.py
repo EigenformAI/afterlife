@@ -76,6 +76,7 @@ def load_sessions(path: Path, default_session: str) -> list[dict[str, Any]]:
         sessions.append({
             "session_id": str(sid) if sid else (default_session if len(items) == 1 else f"{default_session}#{n}"),
             "messages": item["messages"],
+            "tools": item.get("tools") if isinstance(item.get("tools"), list) else None,
         })
     return sessions
 
@@ -149,6 +150,7 @@ def session_experiences(
             "trajectory_ref": f"{source}#session={sid}&exchange={k}",
             "kind": "imported",
             "tags": ["imported"],
+            **({"tools": session["tools"]} if tools == "keep" and session.get("tools") else {}),
         })
     return payloads, stats
 

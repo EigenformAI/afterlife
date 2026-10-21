@@ -52,3 +52,20 @@ def test_a_template_that_rewrites_the_answer_fails():
 def test_a_quantized_model_without_a_known_original_is_flagged():
     report = check_tokenizer(TemplateTokenizer(), "someone/model-bnb-4bit")
     assert any("serve_model" in w for w in report["warnings"])
+
+
+def test_real_qwen3_template_puts_loss_on_the_answer_only():
+    """Downloads only the tokenizer; skipped without transformers or network."""
+    import pytest
+
+    pytest.importorskip("transformers")
+    from afterlife.modelcheck import check_model
+
+    try:
+        report = check_model("unsloth/Qwen3-8B-unsloth-bnb-4bit")
+    except OSError as exc:  # offline, or the hub is unreachable
+        pytest.skip(f"tokenizer not available: {exc}")
+    assert report["status"] == "ok", report
+    for case in report["cases"].values():
+        assert case["trained_text"] == "The answer is 4.<|im_end|>"
+        assert case["scaffold"] == "<think>\n\n</think>\n\n"

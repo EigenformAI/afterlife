@@ -51,7 +51,11 @@ PARAM_BOUNDS: dict[str, tuple[type, float, float, tuple[str, ...] | None]] = {
 
 
 class RecipeError(Exception):
-    pass
+    """A recipe that can't run. ``refused`` marks the operator's limits, as opposed to bad input."""
+
+    def __init__(self, message: str, *, refused: bool = False) -> None:
+        super().__init__(message)
+        self.refused = refused
 
 
 def steps_per_pass(train_rows: int) -> int:
@@ -117,7 +121,7 @@ def resolve_recipe(
     if method not in METHODS:
         raise RecipeError(f"unknown method {method!r}; choose from {', '.join(METHODS)}")
     if method not in config.operator.allowed_methods:
-        raise RecipeError(f"method {method!r} is disabled by the operator")
+        raise RecipeError(f"method {method!r} is disabled by the operator", refused=True)
 
     params: dict[str, Any] = dict(config.methods.get(method, {}))
     for key, value in overrides.items():
@@ -144,11 +148,12 @@ def resolve_recipe(
             most = cap / steps_per_pass(train_rows)
             raise RecipeError(
                 f"epochs={params['epochs']:g} over {train_rows} rows needs {params['max_steps']} steps; "
-                f"operator cap is {cap} steps (at most {most:.2f} epochs for this selection)"
+                f"operator cap is {cap} steps (at most {most:.2f} epochs for this selection)",
+                refused=True,
             )
     params.setdefault("max_steps", 100)
     if params["max_steps"] > cap:
-        raise RecipeError(f"max_steps={params['max_steps']} exceeds operator cap {cap}")
+        raise RecipeError(f"max_steps={params['max_steps']} exceeds operator cap {cap}", refused=True)
     params.setdefault("lora_alpha", params.get("lora_rank", 32))
     recipe = {"method": method, "params": params, "overrides": sorted(overrides)}
     if train_rows:
@@ -177,6 +182,11 @@ def train_sft_kwargs(config: Config, recipe: dict[str, Any]) -> dict[str, Any]:
     if recipe["method"] == "asft":
         kwargs["asft_mode"] = "asft"
         kwargs["asft_kl_weight"] = p.get("asft_kl_weight", 0.1)
+        if kwargs["asft_kl_weight"] == 0:
+            # ASFT without its KL anchor is DFT; the fused DFT path gets there
+            # without ASFT's full-vocabulary logits.
+            kwargs.update(inner_loss="dft", dft_impl="fused")
+            del kwargs["asft_mode"], kwargs["asft_kl_weight"]
     if config.operator.rehearsal_dataset and config.operator.rehearsal_rows_per_epoch > 0:
         kwargs["rehearsal_dataset"] = config.operator.rehearsal_dataset
         kwargs["rehearsal_rows_per_epoch"] = config.operator.rehearsal_rows_per_epoch

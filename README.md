@@ -22,7 +22,7 @@ Everything is stored locally. Training only happens when the worker runs. No ada
 
 ```bash
 git clone git@github.com:EigenformAI/afterlife.git && cd afterlife
-pip install -e .            # agent-facing CLI only: stdlib, no torch, works anywhere
+pip install -e .            # agent-facing CLI only: stdlib, no torch; Linux or macOS (uses fcntl)
 pip install -e '.[train]'   # on the box that trains: unsloth, torch, trl, peft, ...
 ```
 
@@ -101,7 +101,10 @@ Restart or reload the server after either one.
 | Hardware | Qwen3-8B, 4096-token window but short rows (the smoke test): training peaked at ~8 GB (SFT/DFT), ~8.4 GB (ASFT); eval ~19 GB with 2048-token probes. Long rows need more. Each run records `peak_gpu_gb` in its manifest. |
 
 Current vLLM can't load bitsandbytes checkpoints, which is why training and
-serving use different copies of the same model. `afterlife init --model X`
+serving use different copies of the same model. Eval runs on the training
+copy, so served answers can differ on borderline prompts. In one test an SFT
+adapter looped on a safety probe in eval but answered it properly when
+served. Spot-check the served model before relying on an adapter. `afterlife init --model X`
 fills in `serve_model` for known checkpoints; otherwise set it yourself.
 
 **Other models:** only Qwen3 and Qwen2.5 have been trained end to end. Before
@@ -174,7 +177,7 @@ and it is worth starting with few steps and checking for leakage before
 activating. These come from small runs (one model, one seed, a few dozen
 examples), so treat them as starting points rather than rules.
 
-As an agent you will see a short version of these notes through `afterlife methods` and
+Your agent sees a short version of these notes through `afterlife methods` and
 `SKILL.md`, and chooses for itself. You can restrict the choice with
 `[operator].allowed_methods` and set per-method defaults under `[methods.*]`.
 
@@ -183,9 +186,11 @@ As an agent you will see a short version of these notes through `afterlife metho
 All of this lives in `.afterlife/config.toml`:
 
 - `training_enabled`: the master switch for the worker.
-- `allowed_methods`, `max_steps`, `max_examples_per_run` and
-  `min_minutes_between_runs`: hard caps. A request outside them is refused
-  with a reason an agent can read.
+- `allowed_methods`, `max_steps`, `max_examples_per_run`,
+  `min_minutes_between_runs` and `max_pending_requests` (default 3): hard
+  caps. A request outside them is refused with a reason an agent can read.
+- `max_run_minutes`: stop a training or eval process that runs longer than
+  this. Off (0) by default.
 - `agent_may_activate`: set it to `false` if you want to approve adapters
   yourself (`afterlife activate --operator`).
 - `require_verified`, `max_example_chars` and `eval_fraction`: what counts as

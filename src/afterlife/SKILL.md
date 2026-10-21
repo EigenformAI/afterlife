@@ -63,8 +63,10 @@ Marking turns in a longer conversation:
 }
 ```
 
-`tags`, `kind`, `priority`, `session_id` and `url` are optional. Add
-`"eval_only": true` to keep an experience out of training and use it only to
+`tags`, `kind`, `priority`, `session_id` and `url` are optional. If the
+conversation uses tools, add `"tools"`: the tool definitions you were shown
+(OpenAI-style schemas), so the training prompt matches the one you see.
+Add `"eval_only": true` to keep an experience out of training and use it only to
 check a run, for example the same question asked a different way, to see
 whether what you trained carries over to it. Write
 target turns as the behaviour you want, not as a raw dump of what happened.

@@ -1,0 +1,19 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: CPU suite (agent CLI plus torch-free trainer tests)
+        run: uv run --python ${{ matrix.python }} --extra dev pytest -q
+      - name: Real Qwen3 chat template (tokenizer only, no torch)
+        run: uv run --python ${{ matrix.python }} --extra dev --with "transformers>=5.5.0,<5.6.0" --with jinja2 pytest -q tests/trainer/test_modelcheck.py

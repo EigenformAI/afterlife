@@ -94,3 +94,16 @@ def test_context_budget_drops_oldest_exchanges(home, cli, tmp_path):
     _, out = cli("import", "--file", _write(tmp_path, {"messages": session}))
     last = _messages(home, out["added"][-1])
     assert last[0]["content"].startswith("q3") and len(last) == 4  # 6 messages would be 323 chars
+
+
+def test_session_tool_definitions_come_along_unless_tools_are_dropped(tmp_path):
+    from afterlife.importer import load_sessions, session_experiences
+
+    tools = [{"type": "function", "function": {"name": "ls"}}]
+    log = tmp_path / "log.json"
+    log.write_text(json.dumps({"session_id": "s", "tools": tools, "messages": [
+        {"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]}))
+    session = load_sessions(log, "log")[0]
+    kept, _ = session_experiences(session, tools="keep", max_tool_chars=100, max_chars=10000, source="log")
+    dropped, _ = session_experiences(session, tools="drop", max_tool_chars=100, max_chars=10000, source="log")
+    assert kept[0]["tools"] == tools and "tools" not in dropped[0]

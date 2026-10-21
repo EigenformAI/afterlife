@@ -4,7 +4,8 @@ version = "0.1.0"
 description = "Let a local agent choose what its next self learns, via small LoRA adapters."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 # The agent-facing CLI is stdlib-only on purpose: an agent should be able to
 # nominate memories on any box, even one without a GPU or torch installed.
 dependencies = []
@@ -22,13 +23,15 @@ train = [
     "loguru>=0.7.0",
     "python-dotenv>=1.0.0",
 ]
-dev = ["pytest>=8"]
+# loguru and python-dotenv let the torch-free trainer tests (masking, row fitting,
+# check-model) run in the CPU suite.
+dev = ["pytest>=8", "loguru>=0.7.0", "python-dotenv>=1.0.0"]
 
 [project.scripts]
 afterlife = "afterlife.cli:main"
 
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

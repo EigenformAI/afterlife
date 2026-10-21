@@ -42,23 +42,31 @@ CASES: dict[str, list[dict[str, Any]]] = {
     ],
 }
 OPTIONAL_CASES = ("system_and_history", "tool_call")  # a template may legitimately lack these
+TOOLS = {"tool_call": [{"type": "function", "function": {
+    "name": "add", "description": "Add two numbers.",
+    "parameters": {"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+                   "required": ["a", "b"]}}}]}
 
 
 def _render(tokenizer: Any, messages: list[dict[str, Any]], **kwargs: Any) -> str:
     return tokenizer.apply_chat_template(messages, tokenize=False, **kwargs)
 
 
-def check_case(tokenizer: Any, context: list[dict[str, Any]]) -> dict[str, Any]:
-    from afterlife.trainer.qlora import _answer_only_sft_row
+def check_case(tokenizer: Any, context: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    from afterlife.trainer.qlora import _answer_only_sft_row, _template_kwargs
 
+    extra = _template_kwargs(tools)
     try:
-        full = _render(tokenizer, context + [{"role": "assistant", "content": ANSWER}], add_generation_prompt=False)
-        prompt = _render(tokenizer, context, add_generation_prompt=True)
+        full = _render(tokenizer, context + [{"role": "assistant", "content": ANSWER}],
+                       add_generation_prompt=False, **extra)
+        prompt = _render(tokenizer, context, add_generation_prompt=True, **extra)
     except Exception as exc:  # noqa: BLE001 - templates raise anything from jinja errors to ValueError
         return {"status": "fail", "problem": f"template refused it: {type(exc).__name__}: {exc}"}
 
     out: dict[str, Any] = {"status": "ok"}
-    row = _answer_only_sft_row(tokenizer, raw_response=ANSWER, context=context)
+    row = _answer_only_sft_row(tokenizer, raw_response=ANSWER, context=context, tools=tools)
+    if tools:
+        out["tools_rendered"] = "add" in prompt and "Add two numbers" in prompt
     if row is None:
         out.update(status="fail", problem="answer not found on a token boundary: the trainer would fall back "
                                           "and also train on the assistant-turn scaffold")
@@ -88,7 +96,7 @@ def check_tokenizer(tokenizer: Any, base_model: str = "", serve_model: str | Non
             getattr(tokenizer, "tokenizer", None), "chat_template", None):
         return {"status": "fail", "problems": ["no chat template"], "cases": {}}
 
-    cases = {name: check_case(tokenizer, context) for name, context in CASES.items()}
+    cases = {name: check_case(tokenizer, context, TOOLS.get(name)) for name, context in CASES.items()}
     problems, warnings = [], []
     for name, result in cases.items():
         if result["status"] == "fail" and name not in OPTIONAL_CASES:

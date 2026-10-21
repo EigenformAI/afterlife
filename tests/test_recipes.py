@@ -41,3 +41,32 @@ def test_request_and_preview_report_passes(home, cli, write_json):
     assert out["passes_per_example_at_default_steps"]["asft"] == 50.0  # 100 steps, 2 steps per pass
     _, out = cli("train", "--request", "--method", "asft", "--set", "epochs=3")
     assert out["recipe"]["params"]["max_steps"] == 6 and out["recipe"]["passes_per_example"] == 3.0
+
+
+def test_asft_without_kl_runs_as_fused_dft(tmp_path):
+    from afterlife.config import load_config, render_default_config
+    from afterlife.recipes import resolve_recipe, train_sft_kwargs
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(render_default_config())
+    config = load_config(cfg)
+    kwargs = train_sft_kwargs(config, resolve_recipe(config, "asft", {"asft_kl_weight": 0.0}))
+    assert kwargs["inner_loss"] == "dft" and kwargs["dft_impl"] == "fused" and "asft_mode" not in kwargs
+    assert train_sft_kwargs(config, resolve_recipe(config, "asft", {}))["inner_loss"] == "asft"
+
+
+def test_operator_limits_are_refusals_not_input_errors(tmp_path):
+    import pytest
+
+    from afterlife.config import load_config, render_default_config
+    from afterlife.recipes import RecipeError, resolve_recipe
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(render_default_config())
+    config = load_config(cfg)
+    with pytest.raises(RecipeError) as exc:
+        resolve_recipe(config, "sft", {"max_steps": 10_000})
+    assert exc.value.refused
+    with pytest.raises(RecipeError) as exc:
+        resolve_recipe(config, "sft", {"learning_rate": 5.0})
+    assert not exc.value.refused

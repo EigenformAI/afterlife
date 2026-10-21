@@ -263,3 +263,50 @@ def test_effective_heldout_fraction_reflects_whole_sessions(home, cli, write_jso
     counts = build_training_set(store, store.config())["counts"]
     assert counts["heldout_fraction_target"] == 0.15
     assert counts["heldout_fraction_effective"] == 0.5  # one of two sessions
+
+
+@pytest.mark.parametrize("credential", [
+    "AIzaSy" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q",
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+    "hf_" + "a" * 34,
+    "github_pat_" + "11ABCDEFG0" + "x" * 50,
+    "sk_live_" + "4eC39HqLyjWDarjtT1zdp7dc",
+    "postgres://user:hunter22@db.example.com/prod",
+    "api_key = 9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+    'export AWS_SECRET_ACCESS_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"',
+])
+def test_common_credentials_are_refused(credential):
+    exp = experience("a")
+    exp["messages"][1]["content"] = f"Here you go: {credential}"
+    with pytest.raises(ValidationError, match="secret"):
+        build_experience(exp)
+
+
+@pytest.mark.parametrize("benign", [
+    "token = get_token()",
+    "Set api_key in your config file before running.",
+    "The secret to good bread is time.",
+    "https://example.com/docs/page",
+    "def check(password): return len(password) > 8",
+])
+def test_ordinary_text_is_not_mistaken_for_a_credential(benign):
+    exp = experience("a")
+    exp["messages"][1]["content"] = benign
+    build_experience(exp)
+
+
+TOOLS = [{"type": "function", "function": {"name": "add", "parameters": {"type": "object"}}}]
+
+
+def test_tool_definitions_are_stored_and_reach_trainer_rows():
+    exp = build_experience({**experience("a"), "tools": TOOLS})
+    assert exp["training_candidate"]["tools"] == TOOLS
+    assert all(r["tools"] == TOOLS for r in to_trainer_rows(exp))
+    assert "tools" not in to_trainer_rows(build_experience(experience("a")))[0]
+    msgs = exp["training_candidate"]["messages"]
+    assert dedup_key(msgs, TOOLS) != dedup_key(msgs)
+
+
+def test_tools_must_be_a_list_of_objects():
+    with pytest.raises(ValidationError, match="tools must be"):
+        build_experience({**experience("a"), "tools": "add"})

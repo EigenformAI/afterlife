@@ -53,6 +53,11 @@ allowed_methods = ["sft", "dft", "asft"]
 max_examples_per_run = 500
 max_steps = 300
 min_minutes_between_runs = 0
+# Requests waiting for the worker at once; further `train --request` calls are refused.
+max_pending_requests = 3
+# Kill a training or eval process that runs longer than this (0 = no limit).
+# A hung child otherwise holds the worker lock indefinitely.
+max_run_minutes = 0
 # Drop candidates whose verification.status is not "verified".
 require_verified = false
 # Fraction of sessions held out for evaluation, applied only to experiences
@@ -98,6 +103,8 @@ class OperatorConfig:
     max_examples_per_run: int = 500
     max_steps: int = 300
     min_minutes_between_runs: float = 0
+    max_pending_requests: int = 3
+    max_run_minutes: float = 0
     require_verified: bool = False
     eval_fraction: float = 0.15
     max_example_chars: int = 12000
@@ -149,6 +156,10 @@ def load_config(path: Path) -> Config:
     operator = OperatorConfig(**op_raw)
     if not 0 <= operator.eval_fraction < 1:
         raise ConfigError("[operator].eval_fraction must be in [0, 1)")
+    if operator.max_pending_requests < 1:
+        raise ConfigError("[operator].max_pending_requests must be at least 1")
+    if operator.max_run_minutes < 0:
+        raise ConfigError("[operator].max_run_minutes must be 0 (no limit) or more")
 
     eval_raw = raw.get("eval", {})
     unknown = sorted(set(eval_raw) - set(EvalConfig.__dataclass_fields__))

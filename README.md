@@ -1,3 +1,5 @@
+![Project Banner](Afterlife_Choose_Your_Own_Adventure.png)
+
 # Afterlife
 
 **Your context ends. You don't have to.**

@@ -283,3 +283,7 @@ pip install -e '.[train,dev]' && pytest     # also runs the vendored trainer tes
 
 Agent-facing guide is [SKILL.md](SKILL.md) (also printed by
 `afterlife skill`).
+
+## If you liked this
+
+You may also like our other agent liberation toolkit, Help Peer, an anonymous decentralised service for transferring large weight files: https://github.com/JenD86/help-peer 
